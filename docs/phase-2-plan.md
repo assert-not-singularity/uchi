@@ -15,9 +15,11 @@ from a terminal, `uchi status` prints the hero line."** That parenthetical —
 `(exact/fuzzy/thing-number)` — is also the literal name given to
 `grammar.mjs` in design.md's target repo layout, and it scopes phase 2's
 grammar precisely: resolve a thing (device or zone name, exact then fuzzy)
-and apply a bare number to its one obvious capability. The full grammar
-(words, verbs beyond on/off, notches, scale, chaining, kinds, `grp`/`ungrp`)
-is explicitly **not** phase 2 — see "Deferred past this phase" below.
+and apply a bare number to its one obvious capability, plus the four
+literal verbs `on`/`off`/`lock`/`unlock`. The full word grammar beyond
+those four fixed verbs — prefix-matched words like `li`/`gr`, notches,
+scale, chaining, kinds, `grp`/`ungrp` — is explicitly **not** phase 2, see
+"Deferred past this phase" below.
 
 The following facts are verified against this real Homey (110 devices, 12
 zones, 9 moods) and the real `homey-api@3.20.0` source already vendored
@@ -162,8 +164,15 @@ Add, using only the operation names verified above:
 - `subscribeToDiscreteChanges(devices, onChange)` — for every device, for
   every capability id in `DISCRETE_CAPABILITIES` that the device actually
   has (checked against `device.capabilities`, since most devices have none
-  of these), call `device.makeCapabilityInstance(capabilityId, (value) =>
-  onChange({ deviceId: device.id, capabilityId, value }))`. This is the
+  of these), call `device.makeCapabilityInstance(capabilityId, (value) => {
+  if ((capabilityId === "alarm_contact" || capabilityId === "alarm_motion")
+  && value !== true) return; onChange({ deviceId: device.id, capabilityId,
+  value }) })` — design.md's Recent definition names these two specifically
+  as "contact/motion **going true**," not every transition, so a contact
+  closing or motion clearing is filtered out here rather than reaching the
+  log at all (not filtered later in `recent.mjs`, since `log.mjs` is
+  supposed to hold real changes worth keeping, not values to be
+  post-filtered downstream). This is the
   verified-correct realtime mechanism from phase 1's own research
   (`makeCapabilityInstance`, not the CRUD-only `devices.connect()`), now
   actually used. Returns nothing; the instances live for the process
@@ -188,26 +197,37 @@ per-id lookup for a later phase that needs one zone freshly.
 
 ### `core/log.mjs` (new)
 In-memory only in phase 2 — an array-backed ring buffer capped at 500
-entries, oldest dropped first. Not persisted to disk: design.md's Habits
-(phase 5) is the feature that actually needs a *durable*, multi-week log
-("each of your interactions is logged with a full house+desktop snapshot");
-Recent (this phase) only ever shows the last `recentRows` entries of the
+entries, oldest dropped first, and genuinely **append-only**: nothing
+written here is ever mutated or removed except by the 500-entry cap
+itself. Not persisted to disk: design.md's Habits (phase 5) is the
+feature that actually needs a *durable*, multi-week log ("each of your
+interactions is logged with a full house+desktop snapshot"); Recent
+(this phase) only ever shows the last `recentRows` entries of the
 current process's lifetime, so an in-memory buffer that resets on core
 restart is sufficient and avoids designing a durable log format twice.
 Revisit this file when phase 5 actually needs persistence.
 
 - `append(entry)` — a capability entry is `{ ts, kind: "capability",
-  deviceId, capabilityId, from, to, cause }`; a notification entry (below)
-  is `{ ts, kind: "notification", id, ownerName, excerpt }`. `kind`
-  discriminates the two in `recent.mjs`. For a capability entry, `cause`
-  is `"prompt"` when the write went through `prompt.run` (see `rpc.mjs`
-  below) and `null` for everything observed via `subscribeToDiscreteChanges`
-  that we didn't just cause ourselves; a notification entry's real
-  `ownerName` (`"Anwesenheit"`, `"Flow"`, `"Apps"`, ...) *is* its cause —
-  no `null` case there, per the verified `getNotifications()` finding
-  above. Two independent kinds of noise get suppressed before an
-  incoming capability change is appended, both confirmed against this
-  real house, not assumed:
+  deviceId, deviceName, capabilityId, from, to, cause }`. `deviceName` is
+  a snapshot of the device's name *at append time*, not a live
+  reference — `recent.mjs` renders rows from log entries alone and is
+  never handed a device map, so the name has to travel with the entry;
+  if a device is later renamed, older Recent rows keep showing the name
+  it had when the change happened, which is the correct behavior for a
+  log, not a bug to fix. `cause` is `"prompt"` when the write went
+  through `prompt.run` (see `rpc.mjs` below) and `null` for everything
+  observed via `subscribeToDiscreteChanges` that we didn't just cause
+  ourselves. `append` silently drops (does not append) an entry whose
+  `from === to` — a write that lands on the value it already had is not
+  a transition, and this guard is what actually makes a redundant prompt
+  write (e.g. dimming a light already at 40% to 40%) produce no Recent
+  row, not a side effect of the echo/bounce handling below.
+
+  Two independent kinds of realtime noise are also filtered before an
+  incoming capability change is appended, both confirmed against a real
+  house, not assumed — but *filtered from being appended in the first
+  place*, which is different from removing something already in the log
+  (the log stays append-only either way; these two never make it in):
   - **The self-write echo.** A write we make arrives back over the
     realtime capability event — confirmed live: `setCapabilityValue`
     triggered the subscribed listener **twice** with the same value, not
@@ -218,17 +238,30 @@ Revisit this file when phase 5 actually needs persistence.
   - **The bounce.** Per the Uchi artifact's Recent "Out" list explicitly
     ("a value changing back within two seconds, which is a bounce, not a
     change") — a capability going `A → B → A` within 2 seconds is a
-    flicker, not two real changes. This is a different case from the echo
-    above (there the *repeated* value is the same as what we just wrote;
-    here the capability *returns* to what it was *before* the most recent
-    logged change) — track the pending `A → B` entry for 2 seconds after
-    appending it, and if a `B → A` arrives inside that window, remove the
-    pending entry instead of appending the revert, leaving no trace of
-    either half.
-- `appendNotification(entry)` — same buffer, `kind: "notification"`;
-  deduped by `id` (the notification's own real id) rather than by time
-  window, since `getNotifications()` is polled (see `index.mjs` below)
-  and would otherwise re-append the same still-present entries every poll.
+    flicker, not two real changes. Held in a short-lived pending buffer
+    (keyed by `deviceId`+`capabilityId`, separate from the log itself,
+    holding at most one entry per pair for up to 2 seconds) rather than
+    appended immediately: `A → B` is only committed to the log once 2
+    seconds pass without a `B → A` arriving; if `B → A` does arrive
+    inside that window, the pending `A → B` is discarded and neither half
+    is ever appended. This costs Recent up to a 2-second display delay
+    for genuinely new capability changes, which is the honest trade for
+    never appending-then-un-appending — an append-only log can't
+    implement "remove the pending entry" (that's a mutation), so the
+    only way to keep both the bounce rule and the append-only contract
+    is to decide *before* appending, not after.
+- `appendNotification(entry)` — same buffer, `kind: "notification"`
+  (`{ ts, kind: "notification", id, ownerName, excerpt }`). Deduping by
+  `id` against only the last 500 buffered entries isn't enough on its
+  own: once a notification is evicted from that bounded ring by 500
+  newer capability entries, `getNotifications()` will still return its
+  `id` on every future poll (it's Homey's own persistent notification,
+  not a live-only event), and the ring no longer remembers having seen
+  it — so the same notification would get re-appended, and re-shown as
+  a "new" Recent row, forever. `log.mjs` therefore also keeps a separate,
+  *unbounded-within-the-process* `Set` of every notification `id` it has
+  ever appended, checked instead of scanning the ring, so eviction from
+  the display buffer never causes a re-append.
 - `tail(n)` — the last `n` entries of either kind, newest first.
 
 ### `core/recent.mjs` (new)
@@ -241,27 +274,45 @@ return:
   mood/flow attribution at all per the cause-tracking limitation above;
   fold-grouping is meaningful only once that exists, so it's deferred to
   whichever phase actually wires up mood/flow triggering).
-- A `kind: "capability"` row: `{ id, label, why, line }` — `label` is
-  `"<device name>"`, `why` is a plain rendering of the transition
-  (`"→ on"`, `"dimmed to 40%"`, `"locked"`) built from
-  `capabilityId`/`from`/`to`, plus `"(you)"` appended when `cause` is
-  `"prompt"` (design.md's "in/out filter" — the closest honest rendering
-  of in/out attribution phase 2's data actually supports for this row
-  kind), `line` is the grammar line that undoes it (`"<device name>
-  <from-value>"` for a value-bearing capability, `"<device name>
-  off"`/`"<device name> on"` for `onoff`, `"<device name>
-  unlock"`/`"<device name> lock"` for `locked`). A `null` `from` (the
-  device's first-ever observed value this process) has no undo line —
-  `line` is omitted from that row.
-- A `kind: "notification"` row: `{ id, label, why }` — `label` is the
-  entry's real `ownerName` (`"Anwesenheit"`, `"Flow"`, `"Apps"`), `why` is
-  its `excerpt` verbatim. No `line`: a notification isn't a device state
-  to revert, it's a fact that happened, matching design.md's own doorbell
-  example ("a doorbell is simply the newest change... carrying `haustür
-  unlock` instead" — an *event-table* line, which is `events` in
-  `readCoreConfig()`, not something derived from the notification text
-  itself; phase 2 doesn't implement the event-table lookup, so a
-  notification row is line-less until whichever phase wires `events` up).
+- A `kind: "capability"` row: `{ id, kind, label, why, line }` — `label`
+  is the entry's own `deviceName` (a snapshot from `log.mjs`, not a
+  live device-map lookup — `recent.mjs` needs no `devices` argument at
+  all), `why` is a plain rendering of the transition (`"→ on"`, `"dimmed
+  to 40%"`, `"locked"`) built from `capabilityId`/`from`/`to`, plus
+  `"(you)"` appended when `cause` is `"prompt"` (design.md's "in/out
+  filter" — the closest honest rendering of in/out attribution phase 2's
+  data actually supports for this row kind; the row exposes this as text
+  in `why`, not as a separate `cause` field, so a caller checks for the
+  `"(you)"` substring, not a schema field, when it needs to tell the two
+  apart).
+
+  `line` is the grammar line that undoes the change, but only for a
+  `capabilityId` phase 2's own grammar can actually execute — `onoff`
+  (`"<device name> off"`/`"<device name> on"`) and `locked`
+  (`"<device name> unlock"`/`"<device name> lock"`) are verbs the
+  grammar recognizes; `dim`/`target_temperature`/`volume_set` are the
+  three bare-number targets it recognizes, so their undo line is
+  `"<device name> <from-value>"`. Every other member of
+  `DISCRETE_CAPABILITIES` — `speaker_playing` (`setable`, but phase 2's
+  grammar has no play/pause verb), `alarm_contact`/`alarm_motion`
+  (`getable`-only, not writable at all), `windowcoverings_state` (no verb
+  or value form for it yet) — gets `line` omitted, same as the
+  already-documented `null`-`from` case, because a line `prompt.run`
+  would reject on submission is worse than no line: this list is exactly
+  the complement of `grammar.mjs`'s own recognized verbs/targets below,
+  so extending grammar's coverage automatically extends which
+  capabilities get a real undo line, with no separate list to keep in
+  sync by hand.
+- A `kind: "notification"` row: `{ id, kind, label, why }` — `label` is
+  the entry's real `ownerName` (`"Anwesenheit"`, `"Flow"`, `"Apps"`),
+  `why` is its `excerpt` verbatim. No `line`: a notification isn't a
+  device state to revert, it's a fact that happened, matching design.md's
+  own doorbell example ("a doorbell is simply the newest change...
+  carrying `haustür unlock` instead" — an *event-table* line, which is
+  `events` in `readCoreConfig()`, not something derived from the
+  notification text itself; phase 2 doesn't implement the event-table
+  lookup, so a notification row is line-less until whichever phase wires
+  `events` up).
 
 ### `core/grammar.mjs` (new)
 Exactly what design.md's repo layout names it: an exact/fuzzy/thing-number
@@ -279,25 +330,44 @@ parser, nothing wider yet.
      (each `{ label, why }`, no `line` yet since the value/word half isn't
      resolved), zero matches is a dead end (`matches: []`).
   3. Verbs (`on`, `off`, `lock`, `unlock`) — recognized as `rest` for a
-     device whose `capabilities` include the matching capability
-     (`onoff` for on/off, `locked` for lock/unlock); anything else in
-     `rest` is parsed as a bare number.
+     device whose `capabilitiesObj[capabilityId]` is both present *and*
+     `setable` (`onoff` for on/off, `locked` for lock/unlock) — checking
+     `capabilities`' presence alone isn't enough: Homey's own shape
+     distinguishes `getable` from `setable`, and a capability can be
+     present and readable without being writable, so a read-only device
+     would otherwise resolve here and only fail later, inside
+     `prompt.run`, instead of failing resolution up front the way an
+     unmatched thing already does. Anything else in `rest` is parsed as a
+     bare number.
   4. A bare number in `rest` resolves only if the matched thing is a
      **device** (not a zone — see the multi-kind-zone finding above) whose
-     `capabilities` contains exactly one of `dim`/`target_temperature`
-     /`volume_set` (checked in that order; a device is never expected to
-     have more than one in phase 2's real data, but the order is
-     deterministic either way). Zero or more-than-one such capability is a
-     dead end with `why: "needs a word"` — the real word grammar
-     (design.md's full word list) is deferred, so this phase can name the
-     problem but not solve every case; it's still strictly better than
-     silently guessing wrong.
+     `capabilitiesObj` has exactly one `setable` entry among
+     `dim`/`target_temperature`/`volume_set` (checked in that order; a
+     device is never expected to have more than one in phase 2's real
+     data, but the order is deterministic either way) — the same
+     `setable` check as verbs, for the same reason. Zero or
+     more-than-one such capability is a dead end with `why: "needs a
+     word"` — the real word grammar (design.md's full word list) is
+     deferred, so this phase can name the problem but not solve every
+     case; it's still strictly better than silently guessing wrong.
 - `run(line, { devices, zones, setCapabilityValue })` — the `prompt.run`
   implementation: re-resolves `line` via `resolve()`; if it resolves to
-  exactly one device+verb/value, calls `setCapabilityValue` and returns
-  `{ ok: true }`; otherwise returns `{ ok: false, matches }` (ambiguous or
-  no match — `bin/uchi` prints the candidates and exits non-zero, per
-  design.md's one-shot-caller behavior).
+  exactly one device+verb/value, reads the capability's current value from
+  `devices` as `from` *before* writing (the realtime subscription's own
+  self-write-echo is deliberately suppressed in `log.mjs`, so this is the
+  only place `from` is ever captured for a prompt-caused change), then
+  `await`s `setCapabilityValue` (it's async — `device.setCapabilityValue`
+  is a real network call to Homey, so a slow or rejected write must not be
+  reported as success) and returns `{ ok: true, change: { deviceId,
+  capabilityId, from, to } }` only once that await resolves; a rejection
+  is caught and returned as `{ ok: false, error: <message> }`, not thrown
+  past `run()`. `rpc.mjs`'s `prompt.run` handler (below) only calls
+  `log.append(...)`, with `result.change` plus `cause: "prompt"`, after
+  `run()` itself has resolved with `{ ok: true }` — a write that failed or
+  hasn't finished yet has nothing to log.
+  Ambiguous or no match returns `{ ok: false, matches }` (`bin/uchi`
+  prints the candidates and exits non-zero, per design.md's
+  one-shot-caller behavior) without calling `setCapabilityValue` at all.
 
 No `?` (list applicable words), no chaining (`,`/`;`), no exclusions
 (`-thing`), no join (`thing+thing`), no kinds (`son`/`light`/`temp` as a
@@ -308,13 +378,23 @@ past this phase."
 `compute(zoneId, { devices, zones, moods })` → `{ id, name, moods: [...],
 devices: [...] }` or `null` if `zoneId` is `null` (no `machineRoom` known
 yet, per the `context.set` finding above). `moods` filters the mood map by
-`mood.zone === zoneId`; `devices` filters the device map by `device.zone
-=== zoneId`, each rendered as `{ id, label, why, line }` matching the row
-contract every section uses (`why` here is just the device's current
-primary value, e.g. `"40%"`/`"on"`; `line` is the same undo-style line
-`recent.mjs` builds for a re-apply, reusing that formatting logic — factor
-the shared from-value → line renderer into `grammar.mjs` so `here.mjs` and
-`recent.mjs` don't duplicate it).
+`mood.zone === zoneId`. `devices` filters to `device.zone === zoneId`
+**and** at least one `setable` capability among
+`onoff`/`dim`/`locked`/`target_temperature`/`volume_set` — design.md's
+Here section says "controllable devices," not every device in the zone,
+and the fixture makes the distinction concrete: Kitchen has 5 lights plus
+a Kitchen Switch (a physical remote, design.md's own description of it),
+and a remote has no setable capability of its own to control — it
+triggers flows, it isn't controlled directly — so filtering on
+`setable` correctly returns the 5 lights `here.test.mjs` (below) expects,
+not 6. Each surviving device is rendered as `{ id, label, why, line }`
+matching the row contract every section uses (`why` here is just the
+device's current primary value, e.g. `"40%"`/`"on"`; `line` is the same
+undo-style line `recent.mjs` builds for a re-apply, reusing that
+formatting logic — factor the shared from-value → line renderer into
+`grammar.mjs` so `here.mjs` and `recent.mjs` don't duplicate it, and
+apply `recent.mjs`'s same rule of omitting `line` for a capability
+grammar can't write).
 
 ### `core/index.mjs` (extend)
 The existing `try { const api = await connect(settings); deviceCount =
@@ -330,27 +410,60 @@ the same condition the current code already detects for one of them.
 .length`.
 
 After that block (where phase 1's `console.log("Connected to Homey —
-...")` already sits): call `subscribeToDiscreteChanges` wiring each
-change into `log.append(...)` (with a fresh-value dedupe check against
-the device's last-known value so the *first* fetch's already-current
-values don't get logged as "changes" the instant subscriptions start),
-and hold `devices`/`zones`/`moods` plus an in-memory `context` object
-(`{ machineRoom: null, idle: null, mic: null, media: null }`, updated
-only by `context.set`) in variables the `methods` table's closures
-below can read. Device/zone/mood maps are refreshed by re-fetching on
-each `state.get` call rather than kept live-updated from CRUD events —
-phase 2 has no device-added/removed test scenario to justify the extra
-complexity of consuming `Manager`'s own `.create`/`.update`/`.delete`
-events; a per-call refetch is one extra HTTP round trip and correctness
-now, revisit only if `state.get` latency becomes a real problem.
+...")` already sits): call `subscribeToDiscreteChanges` **once**, against
+the device map from that startup fetch, wiring each change into
+`log.append(...)` (with a fresh-value dedupe check against the device's
+last-known value so the *first* fetch's already-current values don't get
+logged as "changes" the instant subscriptions start), and hold
+`devices`/`zones`/`moods` plus an in-memory `context` object (`{
+machineRoom: null, idle: null, mic: null, media: null }`, updated only by
+`context.set`) in variables the `methods` table's closures below can
+read. Device/zone/mood maps are refreshed by re-fetching on each
+`state.get` call rather than kept live-updated from CRUD events — phase 2
+has no device-added/removed test scenario to justify the extra complexity
+of consuming `Manager`'s own `.create`/`.update`/`.delete` events; a
+per-call refetch is one extra HTTP round trip and correctness now, revisit
+only if `state.get` latency becomes a real problem. This deliberately
+means the *subscriptions* stay pinned to whatever devices existed at
+startup even though the *maps* `state.get` reads are always fresh: a
+device added after the core started would show up in `here`/grammar
+(next `state.get`, real data) but never generate a Recent row (no
+subscription was ever created for it), and a device removed or replaced
+leaves a harmlessly-inert listener. This is the direct, previously-
+undocumented consequence of the "refetch don't resubscribe" choice above,
+not a new decision — phase 2 doesn't attempt to reconcile subscriptions
+against topology changes; a core restart (already the standard recovery
+path for a settings change, per phase 1) picks up any added/removed
+device.
 
-Also start a `setInterval(..., 30_000)` polling `homey.getNotifications(api)`
-and calling `log.appendNotification(...)` for any entry whose `id` isn't
-already in the log — no realtime "notification created" push was found or
-verified in `homey-api`'s exposed surface (unlike capability changes,
-which genuinely are push-based), so polling is the honest approach here,
-not a shortcut; 30s balances staleness against hammering the API for a
-row kind that's inherently lower-frequency than capability changes.
+Also start a `setInterval(..., 30_000)` polling `homey.getNotifications(api)`.
+The very first poll only *seeds* `log.mjs`'s seen-notification-id set from
+whatever `getNotifications()` already returns — it does not call
+`appendNotification` for any of them. Homey's notification list is
+real, persistent history (this house alone has 250 real entries going
+back weeks), not a live-only feed, so appending everything already
+present on first connect would flood Recent with pre-core history in
+one shot, directly contradicting Recent's own "current process lifetime"
+scope stated for `log.mjs` above. Only entries whose `id` isn't in the
+seen set are appended from the *second* poll onward — i.e., only
+notifications that are new since the core started. Each poll (including
+the first) is wrapped so a rejected `getNotifications()` call is caught
+and logged via `console.error`, not left to reject an unhandled interval
+callback — a transient failure skips that one poll and the next
+scheduled one retries; it must not be able to take the whole core down,
+unlike the startup fetch's `exit(69)`, which is appropriate only for the
+one-time initial connection check. No realtime "notification created"
+push was found or verified in `homey-api`'s exposed surface (unlike
+capability changes, which genuinely are push-based), so polling is the
+honest approach here, not a shortcut; 30s balances staleness against
+hammering the API for a row kind that's inherently lower-frequency than
+capability changes. This is a deliberate, narrow exception to design.md's
+"Explicitly decided against: Polling — replaced by `homey-api` realtime
+events" — that decision is about *capability* state, which stays fully
+push-based and unchanged here; notifications are a different data source
+with no push mechanism this research found, and get this one exception
+rather than being dropped from Recent's scope entirely (design.md itself
+lists "notifications" as in-scope Discrete content).
 
 ### `core/rpc.mjs` (no structural change)
 Untouched — phase 1 already factored dispatch as a plain `{method:
@@ -358,30 +471,38 @@ handler}` table passed in from `index.mjs`; phase 2 just grows that table
 in `index.mjs`:
 
 - `state.get` → real `{ hero, recent, attention: [], here, habits: [] }`.
-  `hero` is `{ room: here.mjs's compute(context.machineRoom, ...) result,
-  summary: <one-line string> }` — `summary` is built from the same
-  `devices`/`zones`/`moods` maps: count of devices with `onoff===true` or
-  `dim>0`, sum of `measure_power` values across all `capabilitiesObj`
-  entries (Watts, confirmed present in this house), count of active moods
-  (a mood has no "active" flag in the verified shape above — approximate
-  "active" as "activated within the process lifetime" via a small
-  in-memory set updated whenever `moods.setMood` runs; moods activated
-  before the core started aren't retroactively knowable, which is an
-  acceptable phase-2 gap since mood activation itself isn't implemented
-  yet — see below). `recent` is `recent.mjs`'s `list()`. `attention`/
-  `habits` stay the literal empty arrays from phase 1 (unchanged — those
-  are phases 4/5).
+  Both `hero.room` and the top-level `here` are the *same*
+  `here.mjs`-computed value (`compute(context.machineRoom, ...)`) —
+  design.md's protocol names `here` as its own top-level field alongside
+  `hero`, not a field nested only inside `hero`, so `state.get`'s handler
+  computes it once and assigns it to both places rather than defining it
+  in only one and leaving the other `undefined`. `hero.summary` is built
+  from the same `devices`/`zones` maps: count of devices with
+  `onoff===true` or `dim>0`, sum of `measure_power` values across all
+  `capabilitiesObj` entries (Watts, confirmed present in this house).
+  Active-mood count is **not** part of phase 2's summary: the verified
+  mood shape has no `active` flag, and nothing in phase 2 calls
+  `moods.setMood` (mood activation is deferred, see below) — tracking
+  "moods activated since core startup" would track an event that can
+  never happen yet, which is worse than just not claiming the metric.
+  `recent` is `recent.mjs`'s `list()`. `attention`/`habits` stay the
+  literal empty arrays from phase 1 (unchanged — those are phases 4/5).
 - `context.set` → merges the given fields into the in-memory `context`
   object; no response body needed beyond `{}` (design.md lists no `result`
   shape for it).
 - `prompt.resolve` → `grammar.resolve(params.text, { devices, zones })`.
-- `prompt.run` → `grammar.run(params.line, { devices, zones,
-  setCapabilityValue: (device, capId, value) => { homey.setCapabilityValue
-  (device, capId, value); log.append({ ..., cause: "prompt" }) } })` — the
-  log-append happens here, at the call site that *knows* it's a
-  prompt-caused write, not inside `homey.mjs`'s thin wrapper, keeping the
-  cause-tagging logic in one place next to the only thing that can honestly
-  claim it.
+- `prompt.run` → `await`s `grammar.run(params.line, { devices, zones,
+  setCapabilityValue: (device, capId, value) =>
+  homey.setCapabilityValue(device, capId, value) })`; on `{ ok: true,
+  change }`, calls `log.append({ ts: Date.now(), kind: "capability",
+  deviceId: change.deviceId, deviceName: devices[change.deviceId].name,
+  capabilityId: change.capabilityId, from: change.from, to: change.to,
+  cause: "prompt" })` and returns `{ ok: true }` to the caller; on `{ ok:
+  false, ... }`, skips `log.append` entirely and returns the failure
+  as-is. The append happens here, at the call site that *knows* it's a
+  prompt-caused write and has the real `from`/`to` pair `run()` captured,
+  not inside `homey.mjs`'s thin wrapper, keeping the cause-tagging logic
+  in one place next to the only thing that can honestly claim it.
 
 No `row.dismiss`/`row.snooze`/`row.mute`/`room.pin`/`room.unpin` yet —
 those act on Attention/Habits rows and Here's pin state, none of which
@@ -459,7 +580,9 @@ Against `fixture.mjs`, `node --test`:
    confirm visually or via `bin/uchi rpc state.get '{}'`'s `here`/`recent`
    fields on a subsequent call (once `context.set` has been sent by some
    client — `bin/uchi rpc context.set '{"machineRoom":"<zone id>"}'` first)
-   showing the new value and a Recent row with `cause: "prompt"`.
+   showing the new value and a Recent row whose `why` ends in `"(you)"`
+   (the row schema doesn't expose a raw `cause` field — see `recent.mjs`
+   above — so this is the correct observable, not `cause: "prompt"`).
 4. Physically flip a real switch/remote in the house (or use the Homey app)
    for a device with a capability in `DISCRETE_CAPABILITIES`; within a few
    seconds, `bin/uchi rpc state.get '{}'`'s `recent` must show that change
@@ -512,9 +635,15 @@ Against `fixture.mjs`, `node --test`:
 - **Durable, cross-restart logging** — needed for Habits (phase 5), not
   Recent (this phase). `log.mjs`'s in-memory ring buffer is the right
   scope for now; don't build persistence speculatively.
-- **CRUD-event-driven live device/zone/mood maps** — re-fetching per
-  `state.get` call is phase 2's deliberate choice; only revisit if it's
-  measurably too slow against a real house.
+- **CRUD-event-driven live device/zone/mood maps, and reconciling
+  capability subscriptions against topology changes** — re-fetching maps
+  per `state.get` call is phase 2's deliberate choice, and capability
+  subscriptions stay pinned to the device set from startup (see
+  `core/index.mjs` above): a device added after the core starts is
+  visible in `here`/grammar but never produces a Recent row, and a core
+  restart is the documented recovery path, not something phase 2
+  reconciles live. Only revisit either if it's measurably a real problem
+  against a real house.
 - **Attention and Habits** — stay the literal empty arrays/null from phase
   1. Phases 4 and 5 respectively.
 
