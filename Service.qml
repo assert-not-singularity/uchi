@@ -41,6 +41,15 @@ Item {
   property bool spawnScheduled: false
   property bool coreFailed: false
 
+  // Omarchy's plugin installer runs no install hooks (no `npm install` on a
+  // fresh git clone), so this checks for core/'s vendored-at-install-time
+  // dependency once per load and installs it itself if missing — the same
+  // lazy, first-run pattern quickshell.spotify's DaemonManager uses for its
+  // own backend.
+  property bool depsChecked: false
+  property bool depsReady: false
+  property bool installBusy: false
+
   Component.onCompleted: {
     if (root.runtimeDirMissing)
       console.error("uchi: XDG_RUNTIME_DIR is not set — cannot locate the core socket/lock")
@@ -87,6 +96,31 @@ Item {
     coreProcess.running = true
   }
 
+  // The gate every spawn attempt goes through instead of calling spawnCore()
+  // directly: checks once per load whether core/node_modules is present,
+  // installs it via the vendored package.json/package-lock.json if not, and
+  // only then spawns the actual core.
+  function ensureDependencies() {
+    if (root.runtimeDirMissing || coreProcess.running || root.installBusy || depsCheckProcess.running) return
+    if (!root.depsChecked) {
+      depsCheckProcess.command = ["test", "-e", root.pluginDir + "/core/node_modules/homey-api/package.json"]
+      depsCheckProcess.running = true
+      return
+    }
+    if (root.depsReady) {
+      root.spawnCore()
+      return
+    }
+    root.installBusy = true
+    // Not `npm ci --prefix <dir>`: npm's own workspace-root detection under
+    // --prefix gets confused when <dir> is reached through a symlink (exactly
+    // how a locally-installed Omarchy plugin is laid out) and fails with a
+    // spurious "Missing: core@ from lock file" EUSAGE error. Plain `cd` first
+    // does not have this problem.
+    installProcess.command = ["sh", "-c", "cd \"$1\" && exec npm ci --omit=dev", "sh", root.pluginDir + "/core"]
+    installProcess.running = true
+  }
+
   // flock releases its lock automatically on any exit, so an exit code alone
   // tells us who failed and how: 75 is flock itself refusing (someone else
   // already holds the lock, or the lock path is unusable); 78/69 are node's
@@ -97,7 +131,13 @@ Item {
     if (code === 75) {
       var reason = String(coreStderr.text || "").trim()
       if (reason) console.error("uchi: flock could not acquire the core lock: " + reason)
+      // Someone else holds the lock right now, so don't spawn on every 2s
+      // reconnectTimer tick — but that holder (including a core that idle-exits
+      // cleanly) can disappear without us ever having connected to it, so still
+      // retry a spawn on the same 30s cadence as the 78/69 paths rather than
+      // suppressing forever.
       root.suppressSpawn = true
+      scheduleSpawn(30000)
       return
     }
     if (code === 78 || code === 69) {
@@ -162,7 +202,7 @@ Item {
       if (root.connected) return
       socketLoader.active = false
       socketLoader.active = true
-      if (!root.suppressSpawn && !root.spawnScheduled && !coreProcess.running) root.spawnCore()
+      if (!root.suppressSpawn && !root.spawnScheduled) root.ensureDependencies()
     }
   }
 
@@ -175,7 +215,7 @@ Item {
     repeat: false
     onTriggered: {
       root.spawnScheduled = false
-      if (!root.connected) root.spawnCore()
+      if (!root.connected) root.ensureDependencies()
     }
   }
 
@@ -186,6 +226,40 @@ Item {
     stdout: StdioCollector { waitForEnd: false }
     stderr: StdioCollector { id: coreStderr; waitForEnd: true }
     onExited: function(exitCode) { root.handleCoreExit(exitCode) }
+  }
+
+  Process {
+    id: depsCheckProcess
+    running: false
+    command: []
+    onExited: function(exitCode) {
+      root.depsChecked = true
+      root.depsReady = Number(exitCode) === 0
+      root.ensureDependencies()
+    }
+  }
+
+  Process {
+    id: installProcess
+    running: false
+    command: []
+    stdout: StdioCollector { waitForEnd: false }
+    stderr: StdioCollector { id: installStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.installBusy = false
+      if (Number(exitCode) === 0) {
+        root.depsReady = true
+        root.ensureDependencies()
+        return
+      }
+      var reason = String(installStderr.text || "").trim()
+      console.error("uchi: failed to install core dependencies (npm ci exited " + exitCode + ")" + (reason ? ": " + reason : ""))
+      // Not a crash of our own code — retry on the same slow, indefinite
+      // cadence as missing settings / unreachable Homey, not the bounded
+      // crash backoff, since a transient network/npm hiccup shouldn't need a
+      // manual reload to recover from.
+      scheduleSpawn(30000)
+    }
   }
 
   IpcHandler {

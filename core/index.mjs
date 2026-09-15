@@ -23,15 +23,15 @@ async function main() {
     process.exit(78); // sysexits.h EX_CONFIG — Service.qml retries slowly, forever
   }
 
-  let api;
+  let deviceCount;
   try {
-    api = await connect(settings);
+    const api = await connect(settings);
+    deviceCount = await getDeviceCount(api);
   } catch (err) {
     console.error(`could not connect to Homey at ${settings.address}: ${err && err.message ? err.message : err}`);
     process.exit(69); // sysexits.h EX_UNAVAILABLE — Service.qml retries slowly, forever
   }
 
-  const deviceCount = await getDeviceCount(api);
   console.log(`Connected to Homey — ${deviceCount} devices`);
 
   const methods = {

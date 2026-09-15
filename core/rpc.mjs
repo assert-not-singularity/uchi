@@ -27,7 +27,9 @@ export function createRpcServer({ methods }) {
       }
 
       const { id, method, params } = request ?? {};
-      const handler = methods[method];
+      const handler = typeof method === "string" && Object.hasOwn(methods, method)
+        ? methods[method]
+        : undefined;
 
       if (typeof handler !== "function") {
         if (id !== undefined) writeLine(socket, { id, error: { message: `unknown method: ${method}` } });
