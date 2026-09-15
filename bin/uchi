@@ -1,0 +1,157 @@
+#!/usr/bin/env node
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+import crypto from "node:crypto";
+import { spawn } from "node:child_process";
+import net from "node:net";
+import readline from "node:readline";
+
+// Resolved from bin/uchi's own location, never the caller's cwd or argv[1] —
+// this is a CLI, invoked from wherever, not always the repo root.
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.dirname(SCRIPT_DIR);
+const CORE_DIR = path.join(REPO_ROOT, "core");
+
+const SETTINGS_DIR = path.join(os.homedir(), ".local", "state", "omarchy", "settings");
+const SETTINGS_PATH = path.join(SETTINGS_DIR, "uchi.json");
+
+function socketPath() {
+  const runtimeDir = process.env.XDG_RUNTIME_DIR;
+  if (!runtimeDir) {
+    console.error("XDG_RUNTIME_DIR is not set");
+    process.exit(1);
+  }
+  return path.join(runtimeDir, "uchi.sock");
+}
+
+function runCapture(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["inherit", "pipe", "inherit"] });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`${command} exited with code ${code}`));
+        return;
+      }
+      resolve(stdout.trim());
+    });
+  });
+}
+
+async function cmdSetup() {
+  let address;
+  let token;
+  try {
+    address = await runCapture("gum", ["input", "--placeholder", "Homey address, e.g. http://192.168.1.50"]);
+    token = await runCapture("gum", ["input", "--password", "--placeholder", "Homey API token"]);
+  } catch (err) {
+    console.error(`setup cancelled: ${err.message}`);
+    process.exit(1);
+  }
+
+  if (!address || !token) {
+    console.error("both address and token are required");
+    process.exit(1);
+  }
+
+  console.log("Validating against Homey...");
+  const validateExit = await new Promise((resolve, reject) => {
+    const child = spawn("node", [path.join(CORE_DIR, "validate.mjs")], {
+      stdio: ["pipe", "inherit", "inherit"],
+    });
+    child.on("error", reject);
+    child.on("exit", resolve);
+    child.stdin.write(JSON.stringify({ address, token }));
+    child.stdin.end();
+  });
+
+  if (validateExit !== 0) {
+    console.error("Validation failed — check the address and token and try again.");
+    process.exit(1);
+  }
+
+  // Directory mode must be set explicitly even when it already existed:
+  // mkdir's mode argument is silently ignored on an existing directory.
+  fs.mkdirSync(SETTINGS_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(SETTINGS_DIR, 0o700);
+
+  // Created at 0600 directly (never write-then-chmod, which leaves a window at
+  // a more permissive default mode), then renamed into place atomically so a
+  // pre-existing symlink at the final path is never followed or overwritten
+  // in place.
+  const tmpPath = path.join(SETTINGS_DIR, `.uchi.json.${crypto.randomBytes(6).toString("hex")}.tmp`);
+  fs.writeFileSync(tmpPath, JSON.stringify({ address, token }, null, 2), { mode: 0o600, flag: "wx" });
+  fs.renameSync(tmpPath, SETTINGS_PATH);
+
+  console.log(`Settings written to ${SETTINGS_PATH}`);
+}
+
+async function cmdRpc(method, paramsJson) {
+  if (!method) {
+    console.error("usage: uchi rpc <method> [paramsJson]");
+    process.exit(1);
+  }
+
+  let params = {};
+  if (paramsJson) {
+    try {
+      params = JSON.parse(paramsJson);
+    } catch (err) {
+      console.error(`invalid params JSON: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  const socket = net.createConnection(socketPath());
+  await new Promise((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+
+  const id = 1;
+  const rl = readline.createInterface({ input: socket });
+
+  // Match on id *and* the absence of an `event` key — an unsolicited push
+  // (e.g. `connection`, or from phase 2 `state.changed`/`event`) could carry
+  // its own `id` as ordinary payload, coincidentally equal to the request's.
+  const message = await new Promise((resolve, reject) => {
+    rl.on("line", (line) => {
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!parsed || parsed.id !== id || "event" in parsed) return;
+      resolve(parsed);
+    });
+    socket.on("error", reject);
+    socket.write(JSON.stringify({ id, method, params }) + "\n");
+  });
+
+  socket.end();
+
+  if (message.error) {
+    console.error(message.error.message ?? "rpc error");
+    process.exit(1);
+  }
+  console.log(JSON.stringify(message.result, null, 2));
+}
+
+async function main() {
+  const [, , command, ...rest] = process.argv;
+  if (command === "setup") {
+    await cmdSetup();
+  } else if (command === "rpc") {
+    await cmdRpc(rest[0], rest[1]);
+  } else {
+    console.error("usage: uchi <setup|rpc <method> [paramsJson]>");
+    process.exit(1);
+  }
+}
+
+main();
