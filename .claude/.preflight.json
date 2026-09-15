@@ -1,0 +1,4 @@
+{
+  "version": "0.2.0",
+  "installed": ["working-style", "prose-and-docs", "git-conventions", "subagent-orchestration", "lean-implementer", "technical-writer", "web-researcher"]
+}
