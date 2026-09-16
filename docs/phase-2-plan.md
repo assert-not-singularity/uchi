@@ -258,9 +258,20 @@ Add, using only the operation names verified above:
 - `setCapabilityValue(device, capabilityId, value)` → thin wrapper over
   `device.setCapabilityValue(capabilityId, value)` (legacy 2-arg form,
   confirmed to delegate to the real write path in `Device.js`). Takes
-  and returns the raw Homey value — the percent↔normalized conversion
-  below happens in the caller, not here, keeping this wrapper a pure
-  pass-through.
+  the raw Homey value — the percent↔normalized conversion happens in
+  the caller, not here, keeping this wrapper a pure pass-through — and
+  its resolved return value isn't relied on for anything: this is an
+  acknowledgment/success signal, not confirmed to echo back whatever
+  value Homey actually applied (unverified either way; not something
+  this research confirmed), so treating it as "the applied value" would
+  itself be an unverified assumption. `write()` (below) uses the
+  *requested* value for `to`/`currentValue` instead, an accepted
+  approximation for the five capabilities phase 2 writes — each already
+  passes `grammar.mjs`'s own `min`/`max` range check before `write()` is
+  ever called, so silent clamping is not expected for a request this
+  process already validated as in-range; a capability that quietly
+  rounds or steps a value beyond that would still show a real, if
+  slightly imprecise, `to` in Recent rather than a fabricated one.
 - `PERCENT_CAPABILITIES = new Set(["dim", "volume_set"])` with
   `toHomeyValue(capabilityId, percent)` (`percent / 100`) for the two in
   that set, identity for everything else. Verified live against this
@@ -995,8 +1006,15 @@ part of the callback's own contract:
   self-write's expectation is still queued (e.g. a physical switch
   toggled to the value `prompt.run` was already setting) is
   indistinguishable from the real echo and gets consumed by it, and the
-  genuine echo that follows can then be misattributed as external.
-  `makeCapabilityInstance`'s listener (`homey.mjs`'s
+  genuine echo that follows can then be misattributed as external. The
+  same limitation cuts the other way too: if Homey ever applied a
+  capability to a value other than the one requested (see `homey.mjs`'s
+  `setCapabilityValue` above for why this isn't expected for phase 2's
+  five writable capabilities specifically), the real echo would carry
+  that different value, wouldn't match the queued record, and would be
+  misattributed as an external transition instead of consumed as an
+  echo — the same by-value matching trade-off, not a second, separate
+  gap. `makeCapabilityInstance`'s listener (`homey.mjs`'s
   `subscribeToDiscreteChanges`, above) exposes only `value` to `onChange`
   — not the raw socket event's `transactionId`/`transactionTime`
   (verified in the Context section above) — so there's no correlation
@@ -1529,10 +1547,10 @@ Against `fixture.mjs`, `node --test`:
   `cause: "prompt"` entry's `why` includes the `"(you)"` marker and
   renders `in: true`, and a `cause: null` entry's `why` doesn't and
   renders `in: false`; a `kind: "notification"` entry renders as
-  `{label: ownerName, why: excerpt}` with no `line` and no `in` field at
-  all; appending the same notification `id` twice (simulating a re-poll)
-  doesn't duplicate
-  the row; `seedNotificationIds` followed by `appendNotification` for
+  `{label: ownerName, why: excerpt, in: false}` with no `line`; appending
+  the same notification `id` twice (simulating a re-poll) doesn't
+  duplicate the row; `seedNotificationIds` followed by
+  `appendNotification` for
   one of those same ids appends nothing. (The self-write-echo registry,
   the serialized `write()` function, and the `alarm_contact`/
   `alarm_motion` going-true filter all live in `core/index.mjs`'s
