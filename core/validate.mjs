@@ -1,4 +1,4 @@
-import { connect, getDeviceCount } from "./homey.mjs";
+import { connect, getDevices } from "./homey.mjs";
 
 async function readStdin() {
   const chunks = [];
@@ -23,7 +23,7 @@ async function main() {
 
   try {
     const api = await connect({ address, token });
-    const count = await getDeviceCount(api);
+    const count = Object.keys(await getDevices(api)).length;
     console.log(String(count));
     process.exit(0);
   } catch (err) {

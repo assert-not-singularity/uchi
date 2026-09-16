@@ -90,22 +90,7 @@ async function cmdSetup() {
   console.log(`Settings written to ${SETTINGS_PATH}`);
 }
 
-async function cmdRpc(method, paramsJson) {
-  if (!method) {
-    console.error("usage: uchi rpc <method> [paramsJson]");
-    process.exit(1);
-  }
-
-  let params = {};
-  if (paramsJson) {
-    try {
-      params = JSON.parse(paramsJson);
-    } catch (err) {
-      console.error(`invalid params JSON: ${err.message}`);
-      process.exit(1);
-    }
-  }
-
+async function rpcCall(method, params = {}) {
   const socket = net.createConnection(socketPath());
   await new Promise((resolve, reject) => {
     socket.once("connect", resolve);
@@ -116,8 +101,8 @@ async function cmdRpc(method, paramsJson) {
   const rl = readline.createInterface({ input: socket });
 
   // Match on id *and* the absence of an `event` key — an unsolicited push
-  // (e.g. `connection`, or from phase 2 `state.changed`/`event`) could carry
-  // its own `id` as ordinary payload, coincidentally equal to the request's.
+  // (e.g. `connection`, or `state.changed`/`event`) could carry its own `id`
+  // as ordinary payload, coincidentally equal to the request's.
   const message = await new Promise((resolve, reject) => {
     rl.on("line", (line) => {
       let parsed;
@@ -134,12 +119,84 @@ async function cmdRpc(method, paramsJson) {
   });
 
   socket.end();
+  return message;
+}
 
+async function cmdRpc(method, paramsJson) {
+  if (!method) {
+    console.error("usage: uchi rpc <method> [paramsJson]");
+    process.exit(1);
+  }
+
+  let params = {};
+  if (paramsJson) {
+    try {
+      params = JSON.parse(paramsJson);
+    } catch (err) {
+      console.error(`invalid params JSON: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  const message = await rpcCall(method, params);
   if (message.error) {
     console.error(message.error.message ?? "rpc error");
     process.exit(1);
   }
   console.log(JSON.stringify(message.result, null, 2));
+}
+
+async function cmdStatus() {
+  const message = await rpcCall("state.get", {});
+  if (message.error) {
+    console.error(message.error.message ?? "rpc error");
+    process.exit(1);
+  }
+
+  const { hero } = message.result;
+  console.log(hero.summary);
+  // With no context.set ever sent (true for a bare CLI session), hero.room
+  // is null and no room section prints — expected, not a failure.
+  if (hero.room) {
+    console.log(`\n${hero.room.name}`);
+    for (const device of hero.room.devices) {
+      console.log(`  ${device.label} — ${device.why}`);
+    }
+  }
+}
+
+async function cmdPrompt(line) {
+  const message = await rpcCall("prompt.run", { line });
+  if (message.error) {
+    console.error(message.error.message ?? "rpc error");
+    process.exit(1);
+  }
+
+  const result = message.result;
+  if (result.ok) {
+    process.exit(0);
+  }
+
+  // A real write failure carries no `matches` field at all, so `error` and
+  // `room` must be checked before touching `matches`.
+  if (result.error) {
+    console.error(result.error);
+    process.exit(1);
+  }
+
+  if (result.room) {
+    console.log(result.room.name);
+    process.exit(0);
+  }
+
+  const matches = result.matches ?? [];
+  if (matches.length > 0) {
+    for (const match of matches) console.log(`${match.label} — ${match.why}`);
+    process.exit(1);
+  }
+
+  console.error(`no match for '${line}'`);
+  process.exit(1);
 }
 
 async function main() {
@@ -148,9 +205,15 @@ async function main() {
     await cmdSetup();
   } else if (command === "rpc") {
     await cmdRpc(rest[0], rest[1]);
+  } else if (command === "status") {
+    await cmdStatus();
   } else {
-    console.error("usage: uchi <setup|rpc <method> [paramsJson]>");
-    process.exit(1);
+    const line = process.argv.slice(2).join(" ");
+    if (!line) {
+      console.error("usage: uchi <setup|rpc <method> [paramsJson]|status|<prompt line>>");
+      process.exit(1);
+    }
+    await cmdPrompt(line);
   }
 }
 

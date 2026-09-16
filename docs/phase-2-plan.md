@@ -613,28 +613,46 @@ parser, nothing wider yet.
   forming a name, greedily matched against device/zone names before falling
   back token-by-token — device/zone names are unpredictable-length, e.g.
   "Kitchen Switch"). This is a two-stage process, not five independent
-  branches tried in order: stage one (exact, then fuzzy) finds the
-  **thing** — a specific device or zone, or gives up — and stage two
-  decides what `rest` (if anything) means for *that* thing. Stage one
-  only ever identifies *which* device/zone `text` refers to (or that it's
-  ambiguous, or that it's nothing) — it does not by itself produce
-  `resolve()`'s final return value:
+  branches tried in order: stage one finds the **thing** — a specific
+  device or zone, or gives up — and stage two decides what `rest` (if
+  anything) means for *that* thing. Stage one only ever identifies *which*
+  device/zone `text` refers to (or that it's ambiguous, or that it's
+  nothing) — it does not by itself produce `resolve()`'s final return
+  value.
+
+  Stage one is not exact-then-fuzzy as two fully independent passes run
+  one after the other. A full-name match is the degenerate case of a
+  prefix match — a prefix that happens to consume the entire name — so
+  running an exact pass across *every* candidate length before fuzzy ever
+  gets a turn would let a short, low-priority exact match win over a
+  longer, more-specific match the input actually typed toward: a zone
+  named "Attic" must not swallow a query for "Attic Switch," typed in
+  full, merely because "Attic" alone happens to satisfy exact matching at
+  a shorter length that gets tried (and stops) before the longer length
+  is ever considered. So stage one is one loop over candidate length,
+  longest first, checking three priority levels together at *each*
+  length before moving to a shorter one:
   1. **Exact** — case-insensitive full match against every device and zone
-     `name`. A *unique* exact match identifies the thing; more than one
-     device/zone sharing a name (nothing stops two devices being named
-     identically) makes stage one itself ambiguous and `resolve()`
-     returns `matches: [...]` candidates immediately, exactly like an
-     ambiguous fuzzy match does — exactness is about the string match
-     quality, not a promise of uniqueness, so this step must not silently
-     pick one via whatever order `Object.values(devices)` happens to
-     iterate in. Whenever stage one produces more than one candidate for
-     the *same name* — whether an exact match tied on identical names or
-     a fuzzy match tied on identical leading tokens (below) — every such
+     `name`, at the current candidate length. A *unique* exact match
+     identifies the thing; more than one device/zone sharing a name
+     (nothing stops two devices being named identically) makes stage one
+     itself ambiguous and `resolve()` returns `matches: [...]` candidates
+     immediately, exactly like an ambiguous fuzzy match does — exactness
+     is about the string match quality, not a promise of uniqueness, so
+     this step must not silently pick one via whatever order
+     `Object.values(devices)` happens to iterate in. A tie at this level
+     also takes priority over anything level 2/3 would have matched at
+     the *same* length — a zone and a device both named exactly "Attic"
+     resolve as a 2-way ambiguity, not diluted into a 3-way tie by
+     "Attic Switch" also satisfying level 2 at that same length.
+     Whenever stage one produces more than one candidate for the *same
+     name* — whether an exact match tied on identical names or a fuzzy
+     match tied on identical leading tokens (below) — every such
      candidate's `label` is zone-qualified, `"<device name> (<zone
      name>)"`, using `zones` (already in scope here) to look up each
      match's own zone: one shared step applied wherever stage one can
      produce this specific kind of tie, not a fixup limited to the exact
-     branch alone. This is at least what makes two devices sharing a
+     level alone. This is at least what makes two devices sharing a
      name visually distinguishable in the candidate list, rather than
      both showing the identical string with nothing to tell them apart.
      That's the limit of what
@@ -650,11 +668,12 @@ parser, nothing wider yet.
      pair; the fixture adds one deliberately (below) so the ambiguous
      path itself is still tested, distinct from testing that it's
      actually resolvable.
-  2. **Fuzzy** — a case-insensitive match against a **token-aligned**
-     prefix of the name, tried only if stage one found nothing: split
-     the name on whitespace the same way `text` already is, and compare
-     the candidate against the name's own leading tokens joined back
-     together, not the raw name string. This is what keeps `"desk"`
+  2. **Token-aligned prefix** — a case-insensitive match against a
+     **token-aligned** prefix of the name, checked at the current
+     candidate length only after level 1 found nothing at that length:
+     split the name on whitespace the same way `text` already is, and
+     compare the candidate against the name's own leading tokens joined
+     back together, not the raw name string. This is what keeps `"desk"`
      matching only `"Desk Lamp"` (`"desk"` equals its one leading
      token, `"desk"`) and not also this house's `"desktop machine"`
      (`"desk"` is a raw-string prefix of the token `"desktop"`, but not
@@ -662,12 +681,32 @@ parser, nothing wider yet.
      `desk 40` example is explicit that `"desk"` matches only the Desk
      Lamp, so an ordinary substring/prefix scan over the whole name
      string is wrong here even though it's the more obvious
-     implementation. A unique match identifies the thing the same way
-     exact does, multiple matches return `matches: [...]` candidates
-     (each `{ label, why }`, no `line` yet since stage two never ran,
-     and zone-qualified exactly like exact's own duplicate-name case
-     above when two fuzzy matches tie on the same name), zero matches
-     is a dead end (`matches: []`).
+     implementation.
+  3. **Substring** — checked at the current candidate length only after
+     levels 1 and 2 both found nothing at that length: does the candidate
+     appear anywhere inside any single token of the name. This is the
+     fallback for a single-token (often compound) name with no word
+     boundary for level 2 to align a prefix against at all — a real gap
+     found once this plan met a real house: a German-style compound light
+     name (one long token, no spaces) has no token-aligned prefix shorter
+     than the entire word, so without this level, "the least you can
+     type" (design.md's own stated grammar principle) would be false for
+     any single-token name — you'd always have to type the whole thing.
+     The fixture (below) adds one such device so this level has something
+     real to resolve against.
+
+     At every level and every length, a *unique* match identifies the
+     thing the same way exact does; multiple matches return `matches:
+     [...]` candidates (each `{ label, why }`, no `line` yet since stage
+     two never ran, and zone-qualified exactly like the exact-level
+     duplicate-name case above when two matches tie on the same name).
+     Only once *all three* levels find nothing at the current length does
+     the loop try the next-shorter length; zero matches at every length is
+     a dead end (`matches: []`). None of the three levels ranks or scores
+     candidates against each other — a unique hit resolves, more than one
+     is always an ambiguous list to disambiguate from, never a silently
+     auto-picked "best guess": this grammar writes to a real device, so it
+     never guesses when it isn't sure which one you meant.
 
   Once stage one has identified exactly one thing, stage two looks at
   `rest`:
@@ -1640,7 +1679,13 @@ Against `fixture.mjs`, `node --test`:
   action mechanism, confirmed real in phase 1's research but not wired to
   anything yet). Each of these is a grammar.mjs addition on top of the
   same exact/fuzzy/thing-number core this phase ships — no rework
-  expected, just growth.
+  expected, just growth. **Light color and color temperature are a
+  different kind of gap, not just an unbuilt item on this list** — see
+  design.md's "Known gap, not yet designed" note under the prompt grammar:
+  `light_hue`/`light_saturation`/`light_temperature` are real, confirmed
+  capabilities on live devices with no word or value syntax designed for
+  them at all, unlike the items above, which already have a named word or
+  syntax waiting to be implemented. Design the syntax before building it.
 - **Mood/flow activation and Recent's fold-under-mood/flow grouping** —
   `moods.setMood({id})`/`flow.triggerFlow({id})` are confirmed real
   operation names (this phase's research) but nothing calls them yet;

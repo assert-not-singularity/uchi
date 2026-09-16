@@ -111,6 +111,22 @@ Resolution order: **exact** match → **fuzzy** match → **grammar** parse → 
 grammar or its output is rejected — it never runs directly, and it can never touch
 `lock`/unlock verbs).
 
+Exact and fuzzy aren't two independent passes over the whole input: a full-name
+match is the degenerate case of a prefix match (a prefix that happens to consume
+the entire name), so both are priority levels checked together at each candidate
+length, longest length first — a same-length exact match wins over a same-length
+partial-prefix match (so a zone named "Attic" doesn't dilute a query for
+"Attic Switch," typed in full, into a false three-way tie), and a longer match
+of either kind still wins over a shorter one. Fuzzy itself has two levels: a
+token-aligned prefix (the candidate must equal a name's own leading word(s)
+verbatim — "desk" matches "Desk Lamp" but not "Desktop Machine"), then, only if
+that finds nothing, a substring check against any single token of the name —
+the fallback for a single-token (often compound) name with no word boundary to
+align a prefix against at all. Neither fuzzy level ranks or scores candidates:
+a unique hit resolves, more than one is an ambiguous candidate list exactly like
+exact match's own tie case, never a silently auto-picked "best guess" — this
+grammar writes to real devices, so it never guesses when it isn't sure.
+
 The system always wants the least you can type. Every match — thing, word, or
 an otherwise-ambiguous value target — narrows as you type rather than requiring
 a fully-qualified line up front: enough keystrokes to be unique resolves
@@ -147,6 +163,16 @@ known in advance, so uniqueness is checked once, never against live house
 state. An ambiguous prefix (`l` alone, matching both `light` and `lock`)
 behaves like any other ambiguous grammar form: `?` lists the candidates rather
 than guessing.
+
+**Known gap, not yet designed:** light color (hue/saturation) and color
+temperature (warm–cool) have no word or value form anywhere in this grammar.
+Real lights expose them as their own capabilities (`light_hue`,
+`light_saturation`, `light_temperature`, distinct from `dim`), confirmed live
+against a real house — this isn't a hypothetical. Unlike the items under
+"Explicitly decided against" below, this was never evaluated and rejected;
+it's simply missing. Design it (a `color` word, a value syntax for hue/
+saturation, and how it interacts with `light_mode`) before any phase claims
+color control as done.
 
 ## Config: two files, two owners
 
