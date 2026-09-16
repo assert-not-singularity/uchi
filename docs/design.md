@@ -354,7 +354,12 @@ payoff of the core/wrapper split.
 
 - Zone-tree panel with a curated pinned list (v1) — replaced by Here (fixed) +
   prompt room-query.
-- Polling — replaced by `homey-api` realtime events.
+- Polling — replaced by `homey-api` realtime events, for capability state:
+  `makeCapabilityInstance` genuinely pushes every capability change, no
+  polling needed. Notifications are the one exception: `homey-api` exposes
+  no realtime "notification created" push, only `getNotifications()` as a
+  point-in-time fetch, so Recent's notification rows (phase 2) poll it on
+  a fixed interval instead — capability state stays fully push-based.
 - Per-row action methods for what a row proposes — replaced by `prompt.run` and
   the `line` every row carries. (Dismiss/snooze/mute and pin/unpin stay as
   their own methods — they act on the row or panel, not a device, so there's
