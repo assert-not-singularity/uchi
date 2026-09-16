@@ -251,12 +251,17 @@ Revisit this file when phase 5 actually needs persistence.
 
 - `append(entry)` — a capability entry is `{ id, ts, kind: "capability",
   deviceId, deviceName, capabilityId, from, to, cause }`. `id` is a
-  process-local counter `log.mjs` assigns internally (notification
-  entries already carry Homey's own real `id`; a capability entry has no
-  natural id of its own — a device/capability/timestamp triple isn't
-  guaranteed unique against rapid repeated writes — so `log.mjs` mints
-  one the same way for both, and `recent.mjs` copies whichever one is on
-  the entry straight onto the row it renders, uniformly). `deviceName` is
+  process-local counter `log.mjs` mints and assigns here — a capability
+  entry has no natural id of its own (a device/capability/timestamp
+  triple isn't guaranteed unique against rapid repeated writes) — while
+  a notification entry (below) keeps Homey's own real `id` unchanged
+  through `appendNotification`, never reminted: that real id is also
+  what `seedNotificationIds`/the seen-`Set` dedupe against, so replacing
+  it here would disconnect the row's own id from the dedupe key that
+  refers to the same notification. `recent.mjs` copies whichever id is
+  already on the entry — minted or real — straight onto the row it
+  renders, uniformly; only the *source* of the id differs by entry kind,
+  not how `recent.mjs` handles it. `deviceName` is
   a snapshot of the device's name *at append time*, not a live
   reference — `recent.mjs` renders rows from log entries alone and is
   never handed a device map, so the name has to travel with the entry;
@@ -284,18 +289,35 @@ Revisit this file when phase 5 actually needs persistence.
   the Uchi artifact's Recent "Out" list explicitly ("a value changing
   back within two seconds, which is a bounce, not a change") — a
   capability going `A → B → A` within 2 seconds is a flicker, not two
-  real changes. Held in a short-lived pending buffer (keyed by
+  real changes. Held in a short-lived pending slot (keyed by
   `deviceId`+`capabilityId`, separate from the log itself, holding at
-  most one entry per pair for up to 2 seconds) rather than appended
-  immediately: `A → B` is only committed to the log once 2 seconds pass
-  without a `B → A` arriving; if `B → A` does arrive inside that window,
-  the pending `A → B` is discarded and neither half is ever appended.
-  This costs Recent up to a 2-second display delay for genuinely new
-  capability changes, which is the honest trade for never
-  appending-then-un-appending — an append-only log can't implement
-  "remove the pending entry" (that's a mutation), so the only way to
-  keep both the bounce rule and the append-only contract is to decide
-  *before* appending, not after.
+  most one *uncommitted* transition per pair) rather than appended
+  immediately, with a 2-second timer per pending slot that commits it if
+  nothing else arrives first. On each incoming transition `P → Q` for a
+  key with no pending slot: start one holding `P → Q` and its timer. For
+  a key that already has a pending `X → Y` slot: if `Q === X` (the value
+  is reverting to what the pending transition started from), it's a
+  bounce — cancel the timer, discard the pending slot, append nothing
+  for either half. Otherwise (`Q !== X` — a *further*, distinct change,
+  not a reversion of the pending one) the pending `X → Y` is no longer
+  in question — commit it to the log immediately, cancel its timer, and
+  start a new pending slot holding `Y → Q` with its own fresh timer. This
+  is what correctly handles three changes in quick succession
+  (`A → B → C`, neither step a reversion of the other): `A → B` commits
+  the moment `C` arrives (since `C ≠ A`), and `B → C` becomes the new
+  pending slot, rather than the naive one-slot version silently
+  overwriting `A → B` and never appending it, or applying the bounce
+  window to a transition that was never actually reverted. Bounce
+  detection only ever compares an incoming value against the single most
+  recent *pending* transition's origin — it does not scan further back
+  through already-committed history, matching the artifact's own
+  two-value framing ("a value changing back") rather than a general
+  cycle detector. This costs Recent up to a 2-second display delay for
+  the *last* transition in any such run, which is the honest trade for
+  never appending-then-un-appending — an append-only log can't implement
+  "remove an already-appended entry" (that's a mutation), so the only way
+  to keep both the bounce rule and the append-only contract is to decide
+  each transition's fate *before* appending it, not after.
 - `appendNotification(entry)` — same buffer, `kind: "notification"`
   (`{ ts, kind: "notification", id, ownerName, excerpt }`, `id` real and
   Homey's own). Deduping by `id` against only the last 500 buffered
@@ -551,11 +573,17 @@ construction — they're the same five, not a coincidence).
 
 ### `core/index.mjs` (extend)
 The existing `try { const api = await connect(settings); deviceCount =
-await getDeviceCount(api); } catch { ...; process.exit(69); }` block
-becomes `const api = await connect(settings); const devices =
-await homey.getDevices(api);` in that same try (per the retired-
-`getDeviceCount` decision above) — a fetch failure here is still exactly
-the "Homey unreachable" case that existing block's `exit(69)` handles, so
+await getDeviceCount(api); } catch { ...; process.exit(69); }` declares
+`api`/`deviceCount` with `const` scoped to that `try` block — fine in
+phase 1, where nothing outside the block ever reads them again. Phase 2
+does: notification polling needs `api`, and the subscription/write
+machinery below needs `devices`. So `api`, `devices`, `zones`, `moods`,
+and `users` are declared with `let` *before* the `try` (initialized to
+`undefined`, standard for a value a `try` is about to assign), and the
+`try` body simply assigns them — `api = await connect(settings); devices
+= await homey.getDevices(api);` and so on — rather than re-declaring them
+with `const` inside it. A fetch failure here is still exactly the "Homey
+unreachable" case that existing block's `exit(69)` handles, so
 `zones`/`moods`/`users` are fetched in the same try right alongside
 `devices`, not after it: any of the four failing means Homey isn't fully
 available, the same condition the current code already detects for one
@@ -583,18 +611,26 @@ needs to be current *between* `state.get` calls:
   no-op against a cache stuck on the first `true`, and lose a real
   Recent row.
 - The callback checks a `pendingSelfWrites` `Map` (same key shape)
-  *before* deciding to log: if an entry is pending for this exact
-  `(deviceId, capabilityId)` and its value matches, the pending entry is
-  deleted and the event is dropped as a self-write echo — confirmed
-  live that `setCapabilityValue` triggers this callback **twice** with
-  the same value, so this is the expected shape of every self-caused
-  write, not a rare case. This registry, not "the log's most recent
-  entry" (an earlier draft of this plan), is what self-write detection
-  matches against, because the echo can arrive before `rpc.mjs` has
-  even called `log.append` for the prompt-caused write — matching
-  against the log's tail is racy exactly in that window; matching
-  against a registry populated *before* the write is issued (below)
-  isn't.
+  *before* deciding to log: an entry there is `{ value, remaining, timer
+  }` — `remaining` starts at `2` (confirmed live: `setCapabilityValue`
+  triggers this callback **twice** with the same value, not once, so
+  this isn't a rare double-fire to special-case but the expected shape
+  of every self-caused write). On a matching event (same key, same
+  value), decrement `remaining`; drop the event either way (it's an
+  echo), and only delete the pending entry once `remaining` reaches `0`
+  — deleting it after the *first* matching echo, as an earlier draft of
+  this plan did, leaves the *second* echo with nothing to match against,
+  and it would be logged as an external change. `timer` is a fallback:
+  a few seconds after the entry is created, delete it regardless of
+  `remaining`, in case fewer than two echoes ever arrive for some reason
+  — a stale entry that never gets deleted would incorrectly swallow a
+  later *genuine* external write to the same value. This registry, not
+  "the log's most recent entry" (an earlier draft of this plan), is what
+  self-write detection matches against, because the echo can arrive
+  before `rpc.mjs` has even called `log.append` for the prompt-caused
+  write — matching against the log's tail is racy exactly in that
+  window; matching against a registry populated *before* the write is
+  issued (below) isn't.
 - Only once both of those pass does the callback apply the
   `alarm_contact`/`alarm_motion` "going true" filter (design.md wants
   only `value === true` transitions as Recent rows for these two, not
@@ -609,16 +645,33 @@ too, since it's the other thing that needs `currentValue`: `write(device,
 capabilityId, homeyValue)` keeps one promise chain per
 `` `${device.id}:${capabilityId}` `` key (a plain `Map` of the tail
 promise for each key so far) — a second call for the same pair is
-chained after the first's completion rather than run concurrently, so
-two quick writes to the same capability can't interleave and can't both
-capture the same stale `from`. Once it's this call's turn: reads `from`
-from `currentValue` (not from any `devices` snapshot), sets
-`pendingSelfWrites` for that key to the target value, `await`s
-`homey.setCapabilityValue(device, capabilityId, homeyValue)`, updates
-`currentValue` to the new value immediately on success (not waiting for
-the realtime echo, so a same-key write issued right after this one still
-sees the right `from`), and returns `{ deviceId: device.id, deviceName:
-device.name, capabilityId, from, to: homeyValue }` — `deviceName` comes
+chained onto `previousTail.catch(() => {}).then(...)`, not
+`previousTail.then(...)` directly: chaining straight onto the previous
+promise means a *rejected* previous write (a real, expected outcome —
+Homey can reject a write) poisons the chain permanently, since `.then`
+without a rejection handler propagates the rejection forward forever,
+and every later write to that same capability would reject without ever
+running, until a core restart. Swallowing the previous result with
+`.catch(() => {})` before chaining the next call is what keeps one
+transient failure from taking down every future write to that key,
+while queued calls still run in submission order rather than
+concurrently, so two quick writes to the same capability still can't
+interleave or both capture the same stale `from`.
+
+Once it's this call's turn: if `currentValue` has no entry yet for this
+key — a device that didn't exist at startup, made visible only through a
+later `state.get` refetch, per the topology-change limitation below —
+seed one from `device.capabilitiesObj[capabilityId].value` (the value
+already sitting on the resolved device object `write()` was called
+with) before reading anything, rather than reading `from` as `undefined`
+for a device this cache was never told about. Then: reads `from` from
+`currentValue`, sets `pendingSelfWrites` for that key (per the two-echo
+registry above), `await`s `homey.setCapabilityValue(device,
+capabilityId, homeyValue)`, updates `currentValue` to the new value
+immediately on success (not waiting for the realtime echo, so a same-key
+write issued right after this one still sees the right `from`), and
+returns `{ deviceId: device.id, deviceName: device.name, capabilityId,
+from, to: homeyValue }` — `deviceName` comes
 from the `device` object `write()` was called with, captured here rather
 than by `rpc.mjs` reading `devices[change.deviceId].name` after the
 `await` returns: `state.get` can replace the whole `devices` map object
@@ -652,23 +705,29 @@ to reconcile subscriptions against topology changes; a core restart
 picks up any added/removed device.
 
 Notification polling: call `homey.getNotifications(api)` **once,
-immediately** (not inside the interval) right after the block above, and
-pass every `id` it returns to `log.seedNotificationIds(...)` without
-ever calling `appendNotification` for them — Homey's notification list
-is real, persistent history (this house alone has 250 real entries going
-back weeks), not a live-only feed, so appending everything already
-present on first connect would flood Recent with pre-core history in one
-shot, directly contradicting Recent's own "current process lifetime"
-scope stated for `log.mjs` above. *Then* start `setInterval(...,
-30_000)` polling the same `getNotifications(api)` on a repeat, appending
-only entries whose `id` isn't already in the seen set. Doing the first
+immediately** (not inside the interval) right after the block above.
+Only once that call *succeeds* does its result seed
+`log.seedNotificationIds(...)` (never `appendNotification` — Homey's
+notification list is real, persistent history, this house alone has 250
+real entries going back weeks, not a live-only feed, so appending
+everything already present on first connect would flood Recent with
+pre-core history in one shot) and does `setInterval(..., 30_000)` start,
+polling the same `getNotifications(api)` on a repeat and appending only
+entries whose `id` isn't already in the seen set. If the immediate seed
+call *fails*, it does not fall through to starting the interval with an
+empty seen set — that would make the interval's first successful poll
+treat the *entire* real notification history as new, exactly the flood
+the seed step exists to prevent. Instead it retries itself every 5
+seconds (its own short interval, separate from and replaced by the real
+30s one once it succeeds) until a `getNotifications()` call finally
+succeeds, then proceeds to seed and start the real interval as above. Doing the first
 poll immediately and outside the interval, rather than letting
 `setInterval` fire its first callback after the usual 30-second delay,
 matters because `setInterval` genuinely doesn't run its callback until
 the interval elapses: a notification created in that gap between "core
 started" and "first interval fire" would otherwise get folded into the
 *baseline* seed instead of being correctly treated as new. Every poll
-(the immediate one and each interval tick) is wrapped so a rejected
+from the real 30s interval onward is wrapped so a rejected
 `getNotifications()` call is caught and logged via `console.error`, not
 left to reject an unhandled interval callback — a transient failure
 skips that one poll and the next scheduled one retries; it must not be
@@ -754,9 +813,16 @@ are the only realistic callers, and neither needs them until Attention/
 Habits/pinning are themselves real.
 
 ### `bin/uchi` (extend)
-Add: any invocation that isn't `setup` or `rpc` is treated as a prompt
-line — `bin/uchi desk 40` joins `argv.slice(2)` with spaces and sends it as
-`prompt.run { line }`. On `{ ok: true }`, exit 0 silently (matching a
+Add `uchi status` (below) and `uchi setup`/`uchi rpc` (phase 1, unchanged)
+as named subcommands, checked *before* anything else. Only once none of
+those three match is the invocation treated as a prompt line — `bin/uchi
+desk 40` joins `argv.slice(2)` with spaces and sends it as `prompt.run {
+line }`. Checking the named subcommands first, not last, is what a
+"anything that isn't `setup` or `rpc`" catch-all (an earlier draft of
+this plan) gets wrong: `status` isn't `setup` or `rpc` either, so that
+phrasing would send the literal text `"status"` to `prompt.run` instead
+of ever reaching the `uchi status` handling described below. On `{ ok:
+true }`, exit 0 silently (matching a
 successful command-line tool's convention). On failure, `prompt.run` can
 come back three different shapes (per `core/grammar.mjs`'s `run()`
 above), checked in this order — checking `matches.length` first, before
