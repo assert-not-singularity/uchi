@@ -211,12 +211,12 @@ async function main() {
   let startedGeneration = 0;
   let publishedGeneration = 0;
 
-  function heroSummary() {
-    const present = Object.values(users).filter((u) => u.present).map((u) => u.name);
+  function heroSummary(devicesArg, usersArg) {
+    const present = Object.values(usersArg).filter((u) => u.present).map((u) => u.name);
 
     let activeCount = 0;
     let totalDraw = 0;
-    for (const device of Object.values(devices)) {
+    for (const device of Object.values(devicesArg)) {
       const caps = device.capabilitiesObj ?? {};
       if (caps.onoff) {
         if (caps.onoff.value === true) activeCount += 1;
@@ -252,13 +252,21 @@ async function main() {
         moods = freshMoods;
         users = freshUsers;
         publishedGeneration = generation;
-        seedCurrentValues(devices);
+        seedCurrentValues(freshDevices);
       }
 
-      const hereValue = here.compute(context.machineRoom, { devices, zones, moods });
+      // Built from this call's own fetch, not the shared devices/zones/moods
+      // variables — a superseded (losing) call still owes its own caller its
+      // own fresh snapshot; only the shared state other handlers read from
+      // is what a losing call must not overwrite.
+      const hereValue = here.compute(context.machineRoom, {
+        devices: freshDevices,
+        zones: freshZones,
+        moods: freshMoods,
+      });
 
       return {
-        hero: { room: hereValue, summary: heroSummary() },
+        hero: { room: hereValue, summary: heroSummary(freshDevices, freshUsers) },
         recent: recent.list(log.tail(500), coreConfig.recentRows),
         attention: [],
         here: hereValue,
