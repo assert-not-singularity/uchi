@@ -138,14 +138,25 @@ here) wrapped in a `try`/`catch` that treats an `ENOENT` specifically as
 than returning anything for a missing path, so without this catch a
 fresh install with no config file yet (the common case: this config is
 optional, unlike the credentials file `readSettings()` requires) would
-throw at startup instead of falling back to defaults. Any other error
-(e.g. malformed JSON) still propagates rather than being silently
-swallowed as if it were a missing file. On success, parses JSON and
-returns `{ notches, events, recentRows, people, agent }` with defaults
-for every field so a missing or partial file doesn't throw: `{ notches:
-{ light: 10, vol: 5, temp: 1 }, events: {}, recentRows: 20, people: {},
-agent: "off" }`. `notches` is merged one level deep —
-`{ ...defaults.notches, ...(parsed.notches ?? {}) }` — not replaced
+throw at startup instead of falling back to defaults. Any other read
+error (e.g. a permissions problem) still propagates rather than being
+silently swallowed as if it were a missing file. On success, `JSON.
+parse`s the contents, then treats the parsed result as "no usable
+config, use every default" — the same fallback `ENOENT` gets — unless
+it's a plain object: `JSON.parse("null")` (or a bare number, string, or
+array — all syntactically valid JSON) succeeds and returns exactly that,
+not an object, so reading `parsed.notches` off it would throw a
+`TypeError` even though nothing about that file was actually malformed.
+Checking `parsed !== null && typeof parsed === "object" &&
+!Array.isArray(parsed)` before reading any field is what keeps a
+syntactically valid but structurally empty config file from crashing
+startup the same way a missing file must not. With that check passed
+(or defaults applied without it), returns `{ notches, events,
+recentRows, people, agent }` with defaults for every field so a missing
+or partial file doesn't throw: `{ notches: { light: 10, vol: 5, temp: 1
+}, events: {}, recentRows: 20, people: {}, agent: "off" }`. `notches` is
+merged one level deep — `{ ...defaults.notches, ...(parsed.notches ??
+{}) }` — not replaced
 wholesale, so a file that sets only `notches.light` still gets the real
 defaults for `notches.vol`/`notches.temp` instead of leaving them
 `undefined`; every other top-level field (`recentRows`, `agent`, `people`,
@@ -164,11 +175,17 @@ full device map just to count it. Retire `getDeviceCount` as its own
 export: phase 2's `index.mjs` needs the full map anyway (for `state.get`,
 subscriptions, and everything else below), so it derives the startup log's
 device count from that one fetch instead of making a second, redundant
-`devices.getDevices()` round trip at boot. `core/validate.mjs` (`uchi
-setup`'s validator) is `getDeviceCount`'s only other caller and stays as
-architected — it doesn't need the full map, so it keeps calling
-`getDevices(api)` (below) and takes `Object.keys(...).length` itself
-inline, a one-line change.
+`devices.getDevices()` round trip at boot.
+
+### `core/validate.mjs` (extend)
+`getDeviceCount`'s only other caller (`uchi setup`'s validator) — listed
+here as its own file, not folded silently into the `homey.mjs` bullet
+above, since retiring `getDeviceCount` as an export means every one of
+its callers is a required call site, not an optional cleanup. Stays
+architected as it already is — it doesn't need the full device map,
+just the count — so it keeps calling `getDevices(api)` (above) and takes
+`Object.keys(...).length` itself inline where it currently calls
+`getDeviceCount(api)`, a one-line change.
 
 Add, using only the operation names verified above:
 
@@ -230,8 +247,14 @@ Add, using only the operation names verified above:
   normalized 0–1. `target_temperature` was checked the same way and is
   genuinely real degrees (`min: 4, max: 35` on this house's real
   thermostats) — it is **not** in `PERCENT_CAPABILITIES` and needs no
-  conversion, matching design.md's own `"arb temp 21"` example taking a
-  literal degree value. Getting this wrong is exactly how `uchi desk 40`
+  conversion, matching design.md's own `"living temp 21"` example (its
+  example-prompts table: "Living Room's thermostat target becomes 21°")
+  taking a literal degree value — that example itself uses the `temp`
+  word, part of the full word grammar phase 2 doesn't implement (see
+  "Deferred past this phase"), cited here only for the literal-degree
+  convention, not as something phase 2's own bare-number form executes.
+  Getting the degrees-vs-percent distinction wrong is exactly how `uchi
+  desk 40`
   — phase 2's own literal done-criterion — would fail or clamp to full
   brightness instead of dimming to 40%: without this conversion, `40` is
   sent directly where Homey expects `0.4`.
@@ -498,11 +521,22 @@ parser, nothing wider yet.
      quality, not a promise of uniqueness, so this step must not silently
      pick one via whatever order `Object.values(devices)` happens to
      iterate in.
-  2. **Fuzzy** — case-insensitive substring/prefix match, tried only if
-     stage one found nothing; a unique match identifies the thing the
-     same way exact does, multiple matches return `matches: [...]`
-     candidates (each `{ label, why }`, no `line` yet since stage two
-     never ran), zero matches is a dead end (`matches: []`).
+  2. **Fuzzy** — a case-insensitive match against a **token-aligned**
+     prefix of the name, tried only if stage one found nothing: split
+     the name on whitespace the same way `text` already is, and compare
+     the candidate against the name's own leading tokens joined back
+     together, not the raw name string. This is what keeps `"desk"`
+     matching only `"Desk Lamp"` (`"desk"` equals its one leading
+     token, `"desk"`) and not also this house's `"desktop machine"`
+     (`"desk"` is a raw-string prefix of the token `"desktop"`, but not
+     equal to it) — the fixture (below) has both, and design.md's own
+     `desk 40` example is explicit that `"desk"` matches only the Desk
+     Lamp, so an ordinary substring/prefix scan over the whole name
+     string is wrong here even though it's the more obvious
+     implementation. A unique match identifies the thing the same way
+     exact does, multiple matches return `matches: [...]` candidates
+     (each `{ label, why }`, no `line` yet since stage two never ran),
+     zero matches is a dead end (`matches: []`).
 
   Once stage one has identified exactly one thing, stage two looks at
   `rest`:
@@ -695,16 +729,22 @@ runs unconditionally the moment that module loads (phase 1's existing
 entrypoint, unchanged), so `bounceStep` living there would make it
 untestable without also triggering a real connection attempt.
 `bounceStep` takes no `Map`, no timer, and no device — just the
-previous pending entry (or `null`) and the incoming transition — and
-returns `{ commit, pending }`, each either `null` or a `{ from, to, ts }`
-record: `commit` is what the caller should immediately hand to
-`log.append` (or `null` if there's nothing to commit yet), `pending` is
-what the caller should store as the new `pendingTransition` entry for
-this key (or `null` once a bounce has cancelled it out). `index.mjs`
-owns the `Map`, the `alarm_contact`/`alarm_motion` going-true filter,
-and the 2-second timer that calls back into this function when a
-pending entry times out uncontested — `bounce.mjs` itself knows nothing
-about timers, Homey, or any specific capability.
+previous pending entry (or `null`) and a genuinely new incoming
+transition — and returns `{ commit, pending }`, each either `null` or a
+`{ from, to, ts }` record: `commit` is a pending entry the new
+transition immediately displaced (or `null` if there's nothing to
+commit yet), which the caller still has to run through the
+`alarm_contact`/`alarm_motion` going-true filter before `log.append`,
+not hand to it directly; `pending` is what the caller should store as
+the new `pendingTransition` entry for this key (or `null` once a bounce
+has cancelled it out). `bounceStep` is called only when a new, distinct
+value actually arrives — the separate case of a pending entry's
+2-second timer expiring with nothing new having happened at all isn't a
+`bounceStep` call (there's no new transition to pass it), it's
+`index.mjs`'s own `flushPending(key)` glue committing the stored record
+directly (see `core/index.mjs` below). `index.mjs` owns the `Map`, the
+going-true filter, and the 2-second timer; `bounce.mjs` itself knows
+nothing about timers, Homey, logging, or any specific capability.
 
 ### `core/index.mjs` (extend)
 The very first thing this extended `main()` does, before even calling
@@ -804,32 +844,47 @@ needs to be current *between* `state.get` calls:
   `rpc.mjs` has even called `log.append` for the prompt-caused write — a
   check against the log's own tail instead would be racy exactly in that
   window.
-- If the incoming event does **not** match a queued self-write, it's a
-  real transition: the callback now sets `currentValue` for that key to
-  the new value — before any *logging* filtering, though after the
-  self-echo check above — and only *then* decides whether to log
-  anything. Updating the cache before the logging filter, not after, is
-  what keeps a later `alarm_contact`/`alarm_motion` "going true"
+- If the incoming event does **not** match a queued self-write, it's an
+  externally-caused event: the callback now sets `currentValue` for that
+  key to the new value (and bumps that key's `cacheVersion` — see
+  `write()`'s race-guard below) — before any *logging* filtering, though
+  after the self-echo check above — and only *then* decides whether to
+  log anything. Updating the cache before the logging filter, not after,
+  is what keeps a later `alarm_contact`/`alarm_motion` "going true"
   comparison correct: filtering `false` transitions out of `onChange`'s
   *logging* behavior must not also filter them out of what the cache
   remembers, or a `true → false → true` sequence would see the second
   `true` as a no-op against a cache stuck on the first `true`, and lose a
-  real Recent row.
-- Only once past the echo check does the callback feed the transition
-  into bounce-tracking — a `pendingTransition` `Map`, keyed the same
-  way, holding at most one uncommitted `{ from, to, ts, timer }` per key
-  (the same bounce mechanics `core/log.mjs` above describes, owned here
-  instead so it can see every raw transition, per that section) — `ts`
-  is captured here, when the transition is first observed, not left for
-  whichever `log.append` call eventually commits it to assign: on a key
-  with no pending entry, start one holding this transition and the
-  `from` captured above; on a key with a pending `X → Y` entry, either
-  cancel it as a bounce (if the new value equals `X`) or commit it
-  (passing its own captured `ts`, not the current time) and start a
-  fresh pending entry for `Y → newValue` with a newly captured `ts` (if
-  not), as detailed under `core/log.mjs` above. That cancel-or-commit
-  decision is a pure function of the pending entry and the incoming
-  value — it needs no timer, no realtime subscription, and no Homey
+  real Recent row. If the new value equals the `from` captured above,
+  this is a **duplicate, non-self callback** — Homey can fire `onChange`
+  more than once for the same value independent of the two-echo
+  self-write case above, and this one isn't a self-write's echo (it
+  already failed the `pendingSelfWrites` check) — and bounce-tracking is
+  skipped entirely for it: no `bounceStep` call, no change to whatever
+  `pendingTransition` entry or timer already exists for the key. Feeding
+  a no-op transition into `bounceStep` would make it indistinguishable
+  from a genuine new change: with a pending `A → B` already buffered, a
+  duplicate `B` callback would commit `A → B` early and start a bogus
+  `B → B` pending entry, and a real `B → A` reversion arriving after that
+  could no longer cancel anything, since the pending entry it would need
+  to cancel against no longer reflects `A → B`.
+- Only once past the echo check and the no-op check above does the
+  callback feed the transition into bounce-tracking — a
+  `pendingTransition` `Map`, keyed the same way, holding at most one
+  uncommitted `{ from, to, ts, timer }` per key (the same bounce
+  mechanics `core/log.mjs` above describes, owned here instead so it can
+  see every raw transition, per that section) — `ts` is captured here,
+  when the transition is first observed, not left for whichever
+  `log.append` call eventually commits it to assign: on a key with no
+  pending entry, start one holding this transition and the `from`
+  captured above; on a key with a pending `X → Y` entry, either cancel
+  it as a bounce (if the new value equals `X`) or commit it (passing its
+  own captured `ts`, not the current time) and start a fresh pending
+  entry for `Y → newValue` with a newly captured `ts` (if not), as
+  detailed under `core/log.mjs` above. That cancel-or-commit decision —
+  given an existing pending entry and a genuinely new incoming value, is
+  it a bounce or a further change — is a pure function of just those
+  inputs — it needs no timer, no realtime subscription, and no Homey
   connection to run — so it lives in its own new, side-effect-free
   module, `core/bounce.mjs`, as `bounceStep(pending, from, to, ts)`,
   returning `{ commit: { from, to, ts } | null, pending: { from, to, ts
@@ -840,39 +895,54 @@ needs to be current *between* `state.get` calls:
   connection attempt (and phase 1's `exit(69)` on failure) before the
   test itself ever runs — a separate module with no top-level side
   effects is what makes `bounceStep` importable from a test in
-  isolation. `index.mjs`'s `onChange` callback imports `bounceStep` from
-  `core/bounce.mjs` and acts on its result (clearing/replacing the
-  `pendingTransition` map entry, scheduling or clearing the 2-second
-  timer); `core/test/bounce.test.mjs` (below) imports the same function
-  from the same module, directly, no timers or fake realtime callbacks
-  involved. **Every**
-  transition
-  reaches this step, including an `alarm_contact`/`alarm_motion` value
-  going back to `false` — bounce-tracking has to see the real sequence
-  of values to correctly cancel a `true → false` reversion within the
-  window, which it couldn't do if `false` transitions were filtered out
-  before reaching it. The `alarm_contact`/`alarm_motion` "going true"
-  filter (design.md wants only `value === true` transitions as Recent
-  rows for these two, not every transition) is applied only at the
-  moment a transition is actually about to be committed — either
-  immediately (a further distinct change forces the prior pending entry
-  out) or when its 2-second timer fires — right before calling
-  `log.append(...)`: if the committing transition's capability is
-  `alarm_contact`/`alarm_motion` and its `to` isn't `true`, the commit is
-  silently dropped instead of calling `log.append` at all. Applying this
-  filter here, not earlier, is what lets a `true → false` within the
-  bounce window actually cancel the pending `true`, since the `false`
-  that would otherwise never have reached bounce-tracking now does.
-  `log.append` itself still applies the `from === to` no-op dedupe, but
-  only against the `from`/`to` already sitting on the entry it's
-  handed — it never reads `currentValue` itself, since `log.mjs` is a
-  plain buffer with no reference to that cache (see `core/log.mjs`
-  above). What makes that comparison meaningful for the very first event
-  on a freshly subscribed key is this handler capturing `from` *before*
-  updating the cache: the first real event for a key reports the same
-  value `currentValue` was already seeded with at startup, so `from ===
-  to` there and the no-op dedupe correctly drops it instead of logging
-  the startup snapshot as a "change".
+  isolation. `bounceStep` is only ever called with a genuinely new
+  incoming value, never to represent "nothing new happened, just flush
+  what's sitting there" — the 2-second timer needs exactly that second
+  operation (below), which isn't a step of the pending/incoming
+  comparison at all, so it isn't expressed as a `bounceStep` call with
+  some placeholder value. **Every** transition that reaches this step
+  (i.e. survived both checks above), including an `alarm_contact`/
+  `alarm_motion` value going back to `false`, is a genuinely new value —
+  bounce-tracking has to see the real sequence of *distinct* values to
+  correctly cancel a `true → false` reversion within the window, which
+  it couldn't do if `false` transitions were filtered out before
+  reaching it.
+
+  Committing a transition — whether `bounceStep`'s `commit` result (an
+  existing pending entry immediately displaced by a further, distinct
+  change), the 2-second timer firing uncontested, or `write()`'s flush
+  (below) — always goes through the same small step, `commitTransition(
+  record)`: apply the `alarm_contact`/`alarm_motion` "going true" filter
+  (design.md wants only `value === true` transitions as Recent rows for
+  these two, not every transition) — if the record's capability is
+  `alarm_contact`/`alarm_motion` and its `to` isn't `true`, it's silently
+  dropped instead of calling `log.append` at all — then, if it passes,
+  `log.append(...)` with the record's own captured `ts`. Applying the
+  going-true filter here, at commit time, not earlier, is what lets a
+  `true → false` within the bounce window actually cancel the pending
+  `true`, since the `false` that would otherwise never have reached
+  bounce-tracking now does. When `bounceStep` returns a non-null
+  `commit`, the `onChange` callback calls `commitTransition(commit)`
+  directly and then stores `bounceStep`'s `pending` result as the key's
+  new `pendingTransition` entry (replacing the one just committed) — the
+  map is being *replaced*, not emptied, so this case doesn't go through
+  `flushPending`. `flushPending(key)`, used by the 2-second timer and by
+  `write()` (below), is the "empty it out" case instead: given a key
+  with a pending entry, it removes that entry and clears its timer, then
+  calls `commitTransition` on the record it held; given a key with no
+  pending entry, it's a no-op. The 2-second timer's callback for a key
+  is exactly `() => flushPending(key)` — not a `bounceStep` call with no
+  real new value to pass it. `log.append`
+  itself still applies the `from === to` no-op dedupe, but only against
+  the `from`/`to` already sitting on the entry it's handed — it never
+  reads `currentValue` itself, since `log.mjs` is a plain buffer with no
+  reference to that cache (see `core/log.mjs` above). What makes that
+  comparison meaningful for the very first event on a freshly subscribed
+  key is this handler capturing `from` *before* updating the cache: the
+  first real event for a key reports the same value `currentValue` was
+  already seeded with at startup, so `from === to` there and the no-op
+  dedupe correctly drops it instead of logging the startup snapshot as a
+  "change".
 
 The serialized write function — what `rpc.mjs` passes to `grammar.run`
 as `setCapabilityValue` (see `core/grammar.mjs` above) — is defined here
@@ -900,13 +970,43 @@ seed one from `device.capabilitiesObj[capabilityId].value` (the value
 already sitting on the resolved device object `write()` was called
 with) before reading anything, rather than reading `from` as `undefined`
 for a device this cache was never told about. Then: reads `from` from
-`currentValue`, pushes a fresh `{ value: homeyValue, remaining: 2, timer
-}` record onto `pendingSelfWrites`' queue for that key (per the queue
-design above — pushed, never overwriting an existing record), `await`s
-`homey.setCapabilityValue(device, capabilityId, homeyValue)`, updates
-`currentValue` to the new value immediately on success (not waiting for
-the realtime echo, so a same-key write issued right after this one still
-sees the right `from`), and returns `{ deviceId: device.id, deviceName:
+`currentValue`, calls `flushPending(key)` (above) to resolve whatever
+bounce-buffer entry might already be pending for this key, pushes a
+fresh `{ value: homeyValue, remaining: 2, timer }` record onto
+`pendingSelfWrites`' queue for that key (per the queue design above —
+pushed, never overwriting an existing record), and `await`s `homey.
+setCapabilityValue(device, capabilityId, homeyValue)`. Flushing the
+bounce buffer here, before the write's own change ever reaches
+`onChange`, is what a prompt-caused write needs that an ordinary
+external transition doesn't: `run()` appends a prompt write's `{from,
+to}` directly (below), never through `bounceStep`, so a pending external
+transition left buffered under the old value would otherwise still be
+sitting there — stale — the next time a *real* external event for this
+key reaches `bounceStep`, which would then compute its cancel-or-commit
+decision against a `pending.to` that's no longer where the device
+actually was, producing a nonsense committed transition (e.g. recording
+`B → D` for a real `C → D` change, because the stale entry still said
+`to: B`). Flushing on every prompt write is what keeps `pendingTransition`
+never further behind than the write that most recently changed the key.
+
+On success, decides whether to update `currentValue`: a `cacheVersion`
+`Map`, keyed the same way, is incremented every time either `onChange`'s
+real-transition path (above) or this success path itself sets
+`currentValue` for a key. `write()` captures `versionAtStart =
+cacheVersion.get(key) ?? 0` right before the `await` above, and after it
+resolves, only calls `currentValue.set(key, homeyValue)` (bumping
+`cacheVersion`) if the version is still exactly `versionAtStart` —
+unchanged since the write started. If it isn't, a real external
+transition landed on this key while the write was in flight (`onChange`
+is single-threaded JavaScript, so this can only be an interleaving
+across the `await`, never a true data race) and already moved
+`currentValue` to whatever Homey actually holds now; unconditionally
+overwriting it with `homeyValue` at that point would stomp a newer,
+correct value back to a stale one and poison the *next* write's `from`.
+The returned `change` record is unaffected either way — `to: homeyValue`
+is still an honest statement of what this write set the device to at the
+moment it ran, whether or not something else changed it again
+immediately after. `write()` returns `{ deviceId: device.id, deviceName:
 device.name, capabilityId, from, to: homeyValue }` — `deviceName` comes
 from the `device` object `write()` was called with, captured here rather
 than by `rpc.mjs` reading `devices[change.deviceId].name` after the
