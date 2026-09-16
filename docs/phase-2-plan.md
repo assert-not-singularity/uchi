@@ -463,53 +463,38 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   mood/flow attribution at all per the cause-tracking limitation above;
   fold-grouping is meaningful only once that exists, so it's deferred to
   whichever phase actually wires up mood/flow triggering).
-- A `kind: "capability"` row: `{ id, kind, label, why, line }` — `label`
-  is the entry's own `deviceName` (a snapshot from `log.mjs`, not a
-  live device-map lookup — `recent.mjs` needs no `devices` argument at
-  all), `why` is a plain rendering of the transition (`"→ on"`, `"dimmed
-  to 40%"`, `"locked"`) built from `capabilityId`/`from`/`to` — for
-  `dim`/`volume_set` specifically, `from`/`to` are converted through
-  `homey.mjs`'s `toDisplayPercent()` before rendering, since the log
-  stores Homey's real normalized `0–1` value (see `core/homey.mjs`
-  above), and
-  "dimmed to 0.4" would be wrong to show a user who thinks in percent —
-  plus `"(you)"` appended when `cause` is `"prompt"`. Design.md names
-  "in/out filter" as one of phase 2's own literal deliverables (its
-  build-order line, quoted in Context above) but never defines what
-  mechanism that phrase means beyond naming it — no separate protocol
-  field, RPC parameter, or toggle appears anywhere else in design.md.
-  Phase 2's reading of it is attribution as **text**, not a queryable
-  **filter**: `why` carries `"(you)"` (or doesn't) so a human reading a
-  row can tell in from out at a glance, the same way `"(you)"` reads in
-  design.md's own Recent examples, but there's no `recent.list()`
-  parameter, RPC parameter, or structured field a caller could use to
-  actually *filter* — only render — by in/out; a caller that wants to
-  hide one or the other has to parse the `"(you)"` substring itself,
-  not ask the core to do it. That substring-parsing approach is reliable
-  only for `kind: "capability"` rows, whose `why` text is entirely
-  constructed by `recent.mjs` itself (above) — never arbitrary — so
-  `"(you)"` either is or isn't present by construction, nothing to
-  false-positive or -negative on. A `kind: "notification"` row's `why`
-  is `excerpt`, Homey's own free text (above), which a caller has no
-  business substring-matching for this purpose at all — but it also
-  never needs to: a notification is never `prompt`-caused (this process
-  doesn't create notifications, only observes them), so every
-  notification row is unambiguously "out" by its `kind` alone, with no
-  text inspection required to know that. A caller that wants in/out
-  filtering checks `kind` first for a notification row and the `"(you)"`
-  substring only for a capability row — two different, each-reliable
-  checks for the two row kinds, not one unreliable heuristic stretched
-  to cover both. This is the same distinction the
-  cause-attribution limitation above already draws between "descriptive
-  flavor" and "something downstream depends on structurally": a
-  structured filter parameter is exactly the kind of interactive-UI
-  affordance phase 3's actual panel (not `bin/uchi`, phase 2's only
-  client, which has no toggle to wire one to) would be the first real
-  consumer for, so adding one now would be speculative surface area
-  with nothing calling it yet — narrower than "in/out filter" might
-  suggest, but not a shortfall against phase 2's own literal
-  done-criteria, which name neither a filter parameter nor a specific
-  Recent interaction.
+- A `kind: "capability"` row: `{ id, kind, label, why, line, in }` —
+  `label` is the entry's own `deviceName` (a snapshot from `log.mjs`,
+  not a live device-map lookup — `recent.mjs` needs no `devices`
+  argument at all), `why` is a plain rendering of the transition (`"→
+  on"`, `"dimmed to 40%"`, `"locked"`) built from `capabilityId`/`from`/
+  `to` — for `dim`/`volume_set` specifically, `from`/`to` are converted
+  through `homey.mjs`'s `toDisplayPercent()` before rendering, since the
+  log stores Homey's real normalized `0–1` value (see `core/homey.mjs`
+  above), and "dimmed to 0.4" would be wrong to show a user who thinks
+  in percent — plus `"(you)"` appended when `cause` is `"prompt"`, for a
+  human reading the row. `in` is design.md's own "in/out filter"
+  deliverable (its build-order line, quoted in Context above) made
+  structural rather than left as text alone: `in: cause === "prompt"`,
+  a real boolean field a caller can branch on directly, not a substring
+  it has to parse out of `why` itself. This is one field beyond the
+  four design.md's protocol section lists for a generic row (`id`,
+  `label`, `why`, `line?`) — a deliberate, additive extension of that
+  shape for Recent's `kind: "capability"` rows specifically, not a
+  restatement of it: design.md names "in/out filter" as an explicit
+  phase-2 deliverable without ever specifying a mechanism for it
+  anywhere else in the document, and a caller genuinely cannot build a
+  reliable filter out of presentation text alone, particularly once
+  notification rows (next) are mixed into the same list and their `why`
+  is Homey's own arbitrary free text, not something this process
+  controls the wording of. `"(you)"` in `why` and `in` as a field serve
+  two different consumers — a human reading the row, and code that wants
+  to filter the list — and now both exist rather than only the one.
+  A `kind: "notification"` row (next) carries no `in` field at all: a
+  notification is never `prompt`-caused (this process only observes
+  them, never creates one), so it's unambiguously "out" by `kind` alone,
+  and an absent field on that row kind is itself the signal, not a gap
+  to fill with a hardcoded `false`.
 
   `line` is the grammar line that undoes the change, but only for a
   `capabilityId` phase 2's own grammar can actually execute — `onoff`
@@ -624,12 +609,17 @@ parser, nothing wider yet.
      ambiguous fuzzy match does — exactness is about the string match
      quality, not a promise of uniqueness, so this step must not silently
      pick one via whatever order `Object.values(devices)` happens to
-     iterate in. Each candidate's `label` is zone-qualified in this
-     specific case — `"<device name> (<zone name>)"`, using `zones`
-     (already in scope here) to look up each match's own zone — so two
-     devices sharing an exact name are at least visually distinguishable
-     in the candidate list, rather than both showing the identical
-     string with nothing to tell them apart. That's the limit of what
+     iterate in. Whenever stage one produces more than one candidate for
+     the *same name* — whether an exact match tied on identical names or
+     a fuzzy match tied on identical leading tokens (below) — every such
+     candidate's `label` is zone-qualified, `"<device name> (<zone
+     name>)"`, using `zones` (already in scope here) to look up each
+     match's own zone: one shared step applied wherever stage one can
+     produce this specific kind of tie, not a fixup limited to the exact
+     branch alone. This is at least what makes two devices sharing a
+     name visually distinguishable in the candidate list, rather than
+     both showing the identical string with nothing to tell them apart.
+     That's the limit of what
      phase 2 can offer here, not a partial fix left for later: phase 2's
      grammar has no zone-qualified input syntax to *select* one of the
      two by retyping (kinds, zone-scoping, and joins are all deferred,
@@ -656,8 +646,10 @@ parser, nothing wider yet.
      string is wrong here even though it's the more obvious
      implementation. A unique match identifies the thing the same way
      exact does, multiple matches return `matches: [...]` candidates
-     (each `{ label, why }`, no `line` yet since stage two never ran),
-     zero matches is a dead end (`matches: []`).
+     (each `{ label, why }`, no `line` yet since stage two never ran,
+     and zone-qualified exactly like exact's own duplicate-name case
+     above when two fuzzy matches tie on the same name), zero matches
+     is a dead end (`matches: []`).
 
   Once stage one has identified exactly one thing, stage two looks at
   `rest`:
@@ -911,14 +903,30 @@ does: notification polling needs `api`, and the subscription/write
 machinery below needs `devices`. So `api`, `devices`, `zones`, `moods`,
 and `users` are declared with `let` *before* the `try` (initialized to
 `undefined`, standard for a value a `try` is about to assign), and the
-`try` body simply assigns them — `api = await connect(settings); devices
-= await homey.getDevices(api);` and so on — rather than re-declaring them
+`try` body assigns `api` and `devices` — `api = await connect(settings);
+devices = await homey.getDevices(api);` — rather than re-declaring them
 with `const` inside it. A fetch failure here is still exactly the "Homey
-unreachable" case that existing block's `exit(69)` handles, so
-`zones`/`moods`/`users` are fetched in the same try right alongside
-`devices`, not after it: any of the four failing means Homey isn't fully
-available, the same condition the current code already detects for one
-of them. `deviceCount` for the startup log line becomes `Object.keys(
+unreachable" case that existing block's `exit(69)` handles, unchanged
+from phase 1: `devices` (subscriptions, writes, `resolve()`) is load-
+bearing for everything phase 2 does, so it stays startup-critical.
+`zones`/`moods`/`users` do **not** join that same hard gate, even though
+they're fetched in this same startup burst for efficiency (one round of
+requests, not deferred to first use) — each is wrapped in its own
+`try`/`catch` that defaults to `{}` and logs a warning on failure rather
+than exiting: `zones` only feeds Here's room computation, zone-name
+matching, and a bare zone query's `{ room }` reply; `moods` only feeds
+Here's mood chips; `users` only feeds `hero.summary`'s presence line.
+None of the three is needed for `uchi desk 40` itself — a transient
+failure fetching moods, for instance, has no business taking down device
+writes along with it, the same reasoning that already keeps the
+notification poll below from blocking `state.get`/`prompt.run`. A `{}`
+default degrades gracefully (an empty zone/mood/user map, not a crash),
+and the very next `state.get` call re-fetches all three fresh anyway
+(above) — the same call re-fetches `devices` too, so this isn't a
+special retry mechanism, just the existing refetch-every-call design
+already giving each of these three its own natural retry on the next
+request, without this process ever needing to notice or schedule one
+itself. `deviceCount` for the startup log line becomes `Object.keys(
 devices).length`.
 
 After that block (where phase 1's `console.log("Connected to Homey —
@@ -1500,10 +1508,12 @@ Against `fixture.mjs`, `node --test`:
 - Recent: appending a log entry and reading it back renders the expected
   `why`/`line`, including the `dim`/`volume_set` percent-conversion (a
   raw `0.4` entry renders `"40%"`, not `"0.4%"` or `"0.4"`); a
-  `cause: "prompt"` entry's `why` includes the `"(you)"` marker and a
-  `cause: null` entry's doesn't; a `kind: "notification"` entry renders
-  as `{label: ownerName, why: excerpt}` with no `line`; appending the
-  same notification `id` twice (simulating a re-poll) doesn't duplicate
+  `cause: "prompt"` entry's `why` includes the `"(you)"` marker and
+  renders `in: true`, and a `cause: null` entry's `why` doesn't and
+  renders `in: false`; a `kind: "notification"` entry renders as
+  `{label: ownerName, why: excerpt}` with no `line` and no `in` field at
+  all; appending the same notification `id` twice (simulating a re-poll)
+  doesn't duplicate
   the row; `seedNotificationIds` followed by `appendNotification` for
   one of those same ids appends nothing. (The self-write-echo registry,
   the serialized `write()` function, and the `alarm_contact`/
