@@ -73,6 +73,15 @@ locally, not assumed from the design doc's or the artifact's prose:
 - **Mood shape**: `{id, name, preset, devices, zone, uri}` — `zone` is
   present, confirming moods can be filtered per-room for Here's "moods as
   chips" without a separate lookup.
+- **Presence is a per-user field on `users.getUsers()`, not a separate
+  manager call.** `presence.getPresent()` exists in the spec but needs a
+  per-user `id` (checked live: calling it with none throws "Missing
+  Parameter: id") — but `users.getUsers()` already returns each user as
+  `{id, name, present, asleep, ...}` directly, confirmed live against
+  this house's real users. Hero's "presence" component (design.md: the
+  hero's second line is "presence, active moods, total draw") needs
+  nothing beyond this one `getUsers()` fetch — no separate presence
+  manager call, no per-user round trip.
 - **No cause/attribution field exists on the realtime *capability* event,
   but a separate, real notification feed does carry genuine attribution for
   a narrower set of event kinds.** Read `RealtimeConsumer`/`Item.js`
@@ -153,6 +162,8 @@ Add, using only the operation names verified above:
 - `getDevices(api)` → `api.devices.getDevices()`, returned as-is (a map
   keyed by device id — matches what `homey-api` gives us, no
   reshaping needed for phase 2).
+- `getUsers(api)` → `api.users.getUsers()`, returned as-is — used for
+  Hero's presence line, per the verified fact above.
 - `getZones(api)` → `api.zones.getZones()`, same shape convention.
 - `getMoods(api)` → `api.moods.getMoods()`.
 - `DISCRETE_CAPABILITIES = new Set(["onoff", "dim", "locked",
@@ -380,33 +391,46 @@ parser, nothing wider yet.
   Splits `text` into `thing` and `rest` (first whitespace-delimited token(s)
   forming a name, greedily matched against device/zone names before falling
   back token-by-token — device/zone names are unpredictable-length, e.g.
-  "Kitchen Switch"). Thing matching order, per design.md's resolution order:
+  "Kitchen Switch"). This is a two-stage process, not five independent
+  branches tried in order: stage one (exact, then fuzzy) finds the
+  **thing** — a specific device or zone, or gives up — and stage two
+  decides what `rest` (if anything) means for *that* thing. An earlier
+  draft of this plan wrote stages one and two as one flat numbered list
+  and said a unique match at stage one "resolves outright," which reads
+  as stage two being unreachable; to be unambiguous, stage one only ever
+  identifies *which* device/zone `text` refers to (or that it's
+  ambiguous, or that it's nothing) — it does not by itself produce
+  `resolve()`'s final return value:
   1. **Exact** — case-insensitive full match against every device and zone
-     `name`. A *unique* exact match resolves outright; more than one
+     `name`. A *unique* exact match identifies the thing; more than one
      device/zone sharing a name (nothing stops two devices being named
-     identically) becomes `matches: [...]` candidates exactly like an
-     ambiguous fuzzy match does, below — exactness is about the string
-     match quality, not a promise of uniqueness, so this step must not
-     silently pick one via whatever order `Object.values(devices)`
-     happens to iterate in.
-  2. **Fuzzy** — case-insensitive substring/prefix match; unique match
-     resolves outright, multiple matches become `matches: [...]` candidates
-     (each `{ label, why }`, no `line` yet since the value/word half isn't
-     resolved), zero matches is a dead end (`matches: []`).
-  3. **A bare zone match with empty `rest`** — design.md's grammar
-     explicitly supports a bare zone query ("`office` — a bare zone
-     query — lists the Office's devices"), and `prompt.resolve`'s
-     protocol shape already carries a `room?` field for exactly this, so
-     phase 2 returns `{ room: zoneId }` here rather than falling through
-     to a dead end — the zone name matching in steps 1–2 above would
-     otherwise be a documented capability with no reachable result for
-     the one case (a bare zone name, nothing after it) it's actually
-     for. No `line`: design.md is explicit that a bare zone row has none
-     ("**Enter** pins it as Here via `room.pin`," not `prompt.run`) —
-     phase 2 doesn't implement `room.pin` (see `rpc.mjs` below), so
-     `{ room: zoneId }` is as far as this goes; a wrapper or `bin/uchi`
-     that doesn't yet call `room.pin` can still show the zone was
-     recognized.
+     identically) makes stage one itself ambiguous and `resolve()`
+     returns `matches: [...]` candidates immediately, exactly like an
+     ambiguous fuzzy match does — exactness is about the string match
+     quality, not a promise of uniqueness, so this step must not silently
+     pick one via whatever order `Object.values(devices)` happens to
+     iterate in.
+  2. **Fuzzy** — case-insensitive substring/prefix match, tried only if
+     stage one found nothing; a unique match identifies the thing the
+     same way exact does, multiple matches return `matches: [...]`
+     candidates (each `{ label, why }`, no `line` yet since stage two
+     never ran), zero matches is a dead end (`matches: []`).
+
+  Once stage one has identified exactly one thing, stage two looks at
+  `rest`:
+  3. **A zone thing with empty `rest`** — design.md's grammar explicitly
+     supports a bare zone query ("`office` — a bare zone query — lists
+     the Office's devices"), and `prompt.resolve`'s protocol shape
+     already carries a `room?` field for exactly this, so phase 2 returns
+     `{ room: { id: zoneId, name: zone.name } }` — the name travels with
+     the id because `bin/uchi` (below) has no zone map of its own to look
+     one up in; `resolve()` already has `zones` in scope, so it's the one
+     place that can cheaply attach it. No `line`: design.md is explicit
+     that a bare zone row has none ("**Enter** pins it as Here via
+     `room.pin`," not `prompt.run`) — phase 2 doesn't implement
+     `room.pin` (see `rpc.mjs` below), so `{ room }` is as far as this
+     goes; a wrapper or `bin/uchi` that doesn't yet call `room.pin` can
+     still show the zone was recognized.
   4. Verbs (`on`, `off`, `lock`, `unlock`) — recognized as `rest` for a
      device whose `capabilitiesObj[capabilityId]` is both present *and*
      `setable` (`onoff` for on/off, `locked` for lock/unlock) — checking
@@ -442,15 +466,19 @@ parser, nothing wider yet.
   `setCapabilityValue` here is **not** `core/homey.mjs`'s thin wrapper of
   the same name directly — `rpc.mjs` passes in `index.mjs`'s serialized
   write function (below), which performs the real write *and* returns
-  `{ from, to }` itself, reading `from` from its own live current-value
-  cache rather than `grammar.mjs` reading it from the `devices` snapshot:
-  `devices` is only refreshed by `state.get` (see `core/index.mjs`
-  above), so a second `prompt.run` shortly after a first one — two CLI
-  invocations back to back, nothing unusual — would otherwise capture a
-  stale `from` against `resolve()`'s `devices` argument. `run()` forwards
-  whatever `{ from, to }` the write function returns as `{ ok: true,
-  change: { deviceId, capabilityId, from, to } }` once the write settles;
-  a rejection is caught and returned as `{ ok: false, error: <message> }`,
+  `{ deviceId, deviceName, capabilityId, from, to }` itself, reading
+  `from` (and `deviceName`) from its own live state rather than
+  `grammar.mjs` reading either from the `devices` snapshot: `devices` is
+  only refreshed by `state.get` (see `core/index.mjs` above), so a second
+  `prompt.run` shortly after a first one — two CLI invocations back to
+  back, nothing unusual — would otherwise capture a stale `from` against
+  `resolve()`'s `devices` argument, and `state.get` replacing the whole
+  `devices` object while a write is still in flight would otherwise make
+  a post-write `devices[deviceId]` lookup unreliable. `run()` forwards
+  whatever the write function returns as `{ ok: true, change: {
+  deviceId, deviceName, capabilityId, from, to } }` once the write
+  settles; a rejection is caught and returned as `{ ok: false, error:
+  <message> }`,
   not thrown past `run()`. `rpc.mjs`'s `prompt.run` handler (below) only
   calls `log.append(...)`, with `result.change` plus `cause: "prompt"`,
   after `run()` itself has resolved with `{ ok: true }` — a write that
@@ -494,9 +522,19 @@ not 6.
 Each surviving device is rendered as `{ id, label, why, line }` matching
 the row contract every section uses. A device can have more than one of
 the five controllable capabilities at once — an ordinary light has both
-`onoff` and `dim` — so `why`/`line` pick the **first** capability present
-in a fixed priority order, `dim` > `target_temperature` > `volume_set` >
-`onoff` > `locked`: the same order `grammar.mjs`'s bare-number step
+`onoff` and `dim` — so `why`/`line` pick the **first capability that is
+both present *and* `setable`** in a fixed priority order, `dim` >
+`target_temperature` > `volume_set` > `onoff` > `locked`: checking
+presence alone isn't enough, the same reasoning as `grammar.mjs`'s
+`setable` check above — a device could in principle have a read-only
+`dim` (reporting brightness without controlling it) alongside a genuinely
+`setable` `onoff`, and presence-only selection would then choose the one
+capability that can't actually be written, producing a `line` `prompt.run`
+would reject. The zone-level `setable` filter above only guarantees *some*
+capability among the five is controllable, not that it's the
+highest-priority one present, so this second, per-capability `setable`
+check is a distinct, necessary step, not a restatement of the first. The
+priority order itself is the same one `grammar.mjs`'s bare-number step
 already checks value-bearing capabilities in, with `onoff`/`locked`
 appended after as the two verb-only fallbacks for a device with none of
 the three value targets. `why` is that capability's current value,
@@ -518,11 +556,11 @@ becomes `const api = await connect(settings); const devices =
 await homey.getDevices(api);` in that same try (per the retired-
 `getDeviceCount` decision above) — a fetch failure here is still exactly
 the "Homey unreachable" case that existing block's `exit(69)` handles, so
-`zones`/`moods` are fetched in the same try right alongside `devices`,
-not after it: any of the three failing means Homey isn't fully available,
-the same condition the current code already detects for one of them.
-`deviceCount` for the startup log line becomes `Object.keys(devices)
-.length`.
+`zones`/`moods`/`users` are fetched in the same try right alongside
+`devices`, not after it: any of the four failing means Homey isn't fully
+available, the same condition the current code already detects for one
+of them. `deviceCount` for the startup log line becomes `Object.keys(
+devices).length`.
 
 After that block (where phase 1's `console.log("Connected to Homey —
 ...")` already sits): build `currentValue`, a plain `Map` keyed by
@@ -579,15 +617,23 @@ from `currentValue` (not from any `devices` snapshot), sets
 `homey.setCapabilityValue(device, capabilityId, homeyValue)`, updates
 `currentValue` to the new value immediately on success (not waiting for
 the realtime echo, so a same-key write issued right after this one still
-sees the right `from`), and returns `{ from, to: homeyValue }`. A
-rejected `homey.setCapabilityValue` call clears the pending entry it set
-(so a failed write doesn't leave a phantom echo expectation behind) and
-rethrows, for `grammar.run` to catch (see above).
+sees the right `from`), and returns `{ deviceId: device.id, deviceName:
+device.name, capabilityId, from, to: homeyValue }` — `deviceName` comes
+from the `device` object `write()` was called with, captured here rather
+than by `rpc.mjs` reading `devices[change.deviceId].name` after the
+`await` returns: `state.get` can replace the whole `devices` map object
+while this write is in flight, so a lookup against `devices` *after*
+awaiting reads whatever the variable currently points to, not
+necessarily the map this call started against — reading `device.name`
+directly off the already-resolved object handed to `write()` has no such
+window. A rejected `homey.setCapabilityValue` call clears the pending
+entry it set (so a failed write doesn't leave a phantom echo expectation
+behind) and rethrows, for `grammar.run` to catch (see above).
 
-`devices`/`zones`/`moods` plus an in-memory `context` object (`{
+`devices`/`zones`/`moods`/`users` plus an in-memory `context` object (`{
 machineRoom: null, idle: null, mic: null, media: null }`, updated only by
 `context.set`) are held in variables the `methods` table's closures below
-can read. Device/zone/mood maps are refreshed by re-fetching on each
+can read. Device/zone/mood/user maps are refreshed by re-fetching on each
 `state.get` call rather than kept live-updated from CRUD events — phase 2
 has no device-added/removed test scenario to justify the extra complexity
 of consuming `Manager`'s own `.create`/`.update`/`.delete` events; a
@@ -652,17 +698,25 @@ in `index.mjs`:
   design.md's protocol names `here` as its own top-level field alongside
   `hero`, not a field nested only inside `hero`, so `state.get`'s handler
   computes it once and assigns it to both places rather than defining it
-  in only one and leaving the other `undefined`. `hero.summary` is built
-  from the same `devices`/`zones` maps: count of devices considered
-  "active" — `onoff === true` when the device has an `onoff` capability
-  at all (regardless of `dim`'s value: a light switched off but still
-  holding a nonzero `dim` level from before — the normal state after an
-  `onoff`-only "off" command, since turning a light off doesn't reset its
-  remembered brightness — is off, full stop); `dim > 0` only for a
-  device that has `dim` but no `onoff` to check instead. Sum of
-  `measure_power` values across all `capabilitiesObj` entries (Watts,
-  confirmed present in this house). Active-mood count is **not** part of
-  phase 2's summary: the verified
+  in only one and leaving the other `undefined`. `hero.summary` covers
+  two of design.md's three named components ("presence, active moods,
+  total draw") — presence and total draw — built from `devices`/`users`:
+  the names of every user with `present === true` from `homey.getUsers()`
+  (design.md's own Friday-evening example names presence generically,
+  "someone else in the household is home," not by name — showing real
+  names in the summary is this plan's own choice, since `getUsers()`
+  gives real names to work with; nothing in design.md requires it be
+  anonymized), and separately, count of devices considered "active" — `onoff
+  === true` when the device has an `onoff` capability at all (regardless
+  of `dim`'s value: a light switched off but still holding a nonzero
+  `dim` level from before — the normal state after an `onoff`-only "off"
+  command, since turning a light off doesn't reset its remembered
+  brightness — is off, full stop); `dim > 0` only for a device that has
+  `dim` but no `onoff` to check instead — plus the sum of `measure_power`
+  values across all `capabilitiesObj` entries (Watts, confirmed present
+  in this house), together as the "total draw" component. Active-mood
+  count, design.md's third named component, is **not** part of phase 2's
+  summary: the verified
   mood shape has no `active` flag, and nothing in phase 2 calls
   `moods.setMood` (mood activation is deferred, see below) — tracking
   "moods activated since core startup" would track an event that can
@@ -677,16 +731,17 @@ in `index.mjs`:
   setCapabilityValue: write })` — `write` is `core/index.mjs`'s
   serialized write function (above), not `core/homey.mjs`'s thin wrapper
   directly, since it's the one that owns `currentValue` and
-  `pendingSelfWrites` and can honestly report `{ from, to }`. On `{ ok:
-  true, change }`, calls `log.append({ kind: "capability", deviceId:
-  change.deviceId, deviceName: devices[change.deviceId].name,
-  capabilityId: change.capabilityId, from: change.from, to: change.to,
-  cause: "prompt" })` (`ts`/`id` assigned by `log.append` itself) and
-  returns `{ ok: true }` to the caller; on `{ ok: false, room }` (a bare
-  zone query, not a write) or `{ ok: false, matches }` or `{ ok: false,
-  error }`, skips `log.append` entirely and returns the result as-is. The
-  append happens here, at the call site that *knows* it's a
-  prompt-caused write and has the real `from`/`to` pair `run()` captured,
+  `pendingSelfWrites` and can honestly report `{ deviceId, deviceName,
+  capabilityId, from, to }` without touching `devices` again after the
+  write settles. On `{ ok: true, change }`, calls `log.append({ kind:
+  "capability", ...change, cause: "prompt" })` (`ts`/`id` assigned by
+  `log.append` itself; `change` already has every other field `append`
+  needs, spread as-is) and returns `{ ok: true }` to the caller; on `{
+  ok: false, room }` (a bare zone query, not a write) or `{ ok: false,
+  matches }` or `{ ok: false, error }`, skips `log.append` entirely and
+  returns the result as-is. The append happens here, at the call site
+  that *knows* it's a prompt-caused write and has the real `from`/`to`
+  pair `run()` captured,
   not inside `homey.mjs`'s thin wrapper, keeping the cause-tagging logic
   in one place next to the only thing that can honestly claim it.
 
@@ -712,8 +767,10 @@ misreport:
 - `{ error }` — the write itself failed (Homey rejected it, or the
   request errored): print `error` and exit 1.
 - `{ room }` — a bare zone query, not a failure to disambiguate: print
-  the room name and exit 0 — this is a successful room-query result
-  quietly not being a device write, not an error state.
+  `room.name` (the name travels with the id from `resolve()`, per
+  `core/grammar.mjs` above — `bin/uchi` has no zone map of its own to
+  look one up in otherwise) and exit 0 — this is a successful room-query
+  result quietly not being a device write, not an error state.
 - `{ matches }` — ambiguous or no match: `matches.length > 1` prints each
   candidate's `label`/`why` and exits 1; zero matches prints "no match
   for '<line>'" and exits 1 — the one-shot disambiguation behavior
@@ -740,7 +797,10 @@ maps matching the real shapes verified above (`capabilities`/
 `capabilitiesObj` per device, `zone` per device and mood), plus a small
 `notifications` array shaped like real `getNotifications()` entries (one
 `ownerName: "Anwesenheit"` presence entry, one `ownerName: "Flow"` entry)
-for `recent.mjs`'s notification-row tests, so
+for `recent.mjs`'s notification-row tests, and a small `users` array
+(two fictional users, one `present: true` one `present: false`) shaped
+like real `users.getUsers()` entries for `hero.summary`'s presence-line
+test, so
 `grammar.mjs`/`recent.mjs`/`here.mjs` can be tested against it with no
 network and no real Homey — this is what makes those modules unit-testable
 the same way phase 1 made `rpc.mjs` unit-testable against a plain dispatch
@@ -758,7 +818,8 @@ Against `fixture.mjs`, `node --test`:
   lights + speaker + thermostat) with a bare number returns the "needs a
   word" dead end, not a guess; assert `"front door"` resolves to the
   Front Door lock uniquely; assert a bare `"office"` (no verb/value)
-  resolves to `{ room: <Office's zone id> }`; assert two fixture entries
+  resolves to `{ room: { id: <Office's zone id>, name: "Office" } }`;
+  assert two fixture entries
   sharing an exact name (added to the fixture specifically for this
   case) resolve as ambiguous `matches`, not an arbitrary pick.
 - Recent: appending a log entry and reading it back renders the expected
