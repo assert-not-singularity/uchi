@@ -401,17 +401,22 @@ Revisit this file when phase 5 actually needs persistence.
   longer remembers having seen it — so the same notification would get
   re-appended, and re-shown as a "new" Recent row, forever. `log.mjs`
   therefore also keeps a separate `Set` of every notification `id` it
-  has appended, checked instead of scanning the ring, so eviction from
-  the display buffer never causes a re-append — but capped at 2000
-  entries, not left to grow for the process's entire lifetime: a plain
-  `Set` preserves insertion order, so once adding an id would exceed the
-  cap, the oldest-inserted id is deleted first. This house's real
-  notification history is 250 entries total going back weeks (see
-  Context above); 2000 is generous headroom against that real volume,
-  bounding this `Set`'s memory to a fixed size instead of growing
-  without limit across however long a single core process stays up,
-  while still comfortably covering realistic notification rates between
-  restarts.
+  has ever appended, checked instead of scanning the ring, so eviction
+  from the display buffer never causes a re-append. This `Set` is
+  genuinely unbounded for the life of the process, deliberately, not an
+  oversight: capping it at a fixed size and evicting the oldest id once
+  full would reintroduce the exact re-append bug it exists to prevent —
+  `getNotifications()` returning Homey's own persistent history means
+  an evicted id can still come back on a later poll, exactly like the
+  bounded display ring above, just with a bigger number before it
+  happens. There's no watermark available to bound it safely either:
+  this research found no Homey API guarantee about how far back a poll
+  can return or how many total notifications it retains, so any fixed
+  cap is a correctness risk with no real memory payoff to justify it —
+  this house's entire real notification history is 250 entries going
+  back weeks (see Context above), so this `Set`'s actual growth over
+  even a long-lived core process is a few hundred short strings, not a
+  practical memory concern.
 - `seedNotificationIds(ids)` — adds every id in `ids` to that same seen
   set *without* appending anything. This is the explicit, named
   operation `core/index.mjs`'s first notification poll needs (below): it
@@ -480,7 +485,21 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   parameter, RPC parameter, or structured field a caller could use to
   actually *filter* — only render — by in/out; a caller that wants to
   hide one or the other has to parse the `"(you)"` substring itself,
-  not ask the core to do it. This is the same distinction the
+  not ask the core to do it. That substring-parsing approach is reliable
+  only for `kind: "capability"` rows, whose `why` text is entirely
+  constructed by `recent.mjs` itself (above) — never arbitrary — so
+  `"(you)"` either is or isn't present by construction, nothing to
+  false-positive or -negative on. A `kind: "notification"` row's `why`
+  is `excerpt`, Homey's own free text (above), which a caller has no
+  business substring-matching for this purpose at all — but it also
+  never needs to: a notification is never `prompt`-caused (this process
+  doesn't create notifications, only observes them), so every
+  notification row is unambiguously "out" by its `kind` alone, with no
+  text inspection required to know that. A caller that wants in/out
+  filtering checks `kind` first for a notification row and the `"(you)"`
+  substring only for a capability row — two different, each-reliable
+  checks for the two row kinds, not one unreliable heuristic stretched
+  to cover both. This is the same distinction the
   cause-attribution limitation above already draws between "descriptive
   flavor" and "something downstream depends on structurally": a
   structured filter parameter is exactly the kind of interactive-UI
@@ -605,7 +624,24 @@ parser, nothing wider yet.
      ambiguous fuzzy match does — exactness is about the string match
      quality, not a promise of uniqueness, so this step must not silently
      pick one via whatever order `Object.values(devices)` happens to
-     iterate in.
+     iterate in. Each candidate's `label` is zone-qualified in this
+     specific case — `"<device name> (<zone name>)"`, using `zones`
+     (already in scope here) to look up each match's own zone — so two
+     devices sharing an exact name are at least visually distinguishable
+     in the candidate list, rather than both showing the identical
+     string with nothing to tell them apart. That's the limit of what
+     phase 2 can offer here, not a partial fix left for later: phase 2's
+     grammar has no zone-qualified input syntax to *select* one of the
+     two by retyping (kinds, zone-scoping, and joins are all deferred,
+     see "Deferred past this phase"), so retyping the identical name
+     produces the identical ambiguous result again. Two devices sharing
+     one exact name are unresolvable by text in phase 2's grammar,
+     full stop — a real constraint of this phase's scope, not this
+     step's implementation, and one Homey's own naming freedom creates,
+     not something `resolve()` can route around. This house has no such
+     pair; the fixture adds one deliberately (below) so the ambiguous
+     path itself is still tested, distinct from testing that it's
+     actually resolvable.
   2. **Fuzzy** — a case-insensitive match against a **token-aligned**
      prefix of the name, tried only if stage one found nothing: split
      the name on whitespace the same way `text` already is, and compare
@@ -692,9 +728,18 @@ parser, nothing wider yet.
      real degrees. The converted value is then checked against that
      capability's own `min`/`max` (real, verified fields — `dim`/
      `volume_set` are `0–1`, this house's real thermostats are `4–35`)
-     and out-of-range is `matches: [{ label: thing.name, why: "out of
-     range (min–max)" }]`, resolved no further than that — the same
-     `matches`-as-a-single-candidate shape as the two dead ends above,
+     and out-of-range is `matches: [{ label: thing.name, why: "needs
+     <min>–<max>" }]`, with `<min>`/`<max>` interpolated as the
+     *user-facing* bounds, not the raw stored ones: `toDisplayPercent()`
+     converted for `dim`/`volume_set` (`"needs 0–100"`, not `"needs
+     0–1"` — the typed value was already a percent, so the error has to
+     speak percent back, not the internal normalized range that would
+     read as nonsense against a typed `200`), and the real degree values
+     as-is for `target_temperature` (`"needs 4–35"`) — a literal `"out
+     of range (min–max)"` placeholder would tell the user nothing about
+     what range would actually work, resolved no further than that — the
+     same `matches`-as-a-single-candidate shape as the two dead ends
+     above,
      not sent to `setCapabilityValue` at all. Skipping this would let
      Homey decide whether to reject or silently clamp an out-of-range
      write; either way, if `write()` still recorded the *requested*
@@ -969,14 +1014,27 @@ needs to be current *between* `state.get` calls:
   not noise to hide — nothing in design.md calls for suppressing or
   delaying a single key's own reversal, so this callback doesn't buffer,
   delay, or cancel anything: it calls `log.append({ kind: "capability",
-  deviceId, capabilityId, deviceName: device.name, from, to: value,
-  cause: null })` directly for every externally-caused
+  deviceId, capabilityId, deviceName: devices[deviceId]?.name ??
+  device.name, from, to: value, cause: null })` directly for every
+  externally-caused
   transition that reaches this point — no pending map, no timer — except
   one: if the capability is `alarm_contact`/`alarm_motion` and `value`
   isn't `true`, the call is skipped entirely, per design.md's "contact/
   motion going true" wording for what counts as Discrete at all — a
   `true → false` transition for these two was never meant to be its own
   Recent row in the first place, independent of any window or reversal.
+  `deviceName` reads the *live* `devices` map (the module-level variable
+  `state.get` reassigns on every call, above), not the `device` object
+  `subscribeToDiscreteChanges` closed over at startup — that startup
+  object is never replaced once the subscription exists, so a device
+  renamed after startup would otherwise log every future external
+  transition under its old name forever, contradicting `log.append`'s
+  own "snapshot at append time" contract for `deviceName` (above): the
+  snapshot has to actually be taken *at append time*, not at
+  subscription-creation time. The `?? device.name` fallback covers the
+  one case a live lookup can miss — a device removed from a later
+  `state.get`'s fresh map (the topology-change limitation below) — where
+  the startup snapshot is the only name left to fall back on.
   `log.append`'s own `from === to` no-op dedupe (above) still drops a
   duplicate callback reporting the same value again, or the very first
   event on a freshly subscribed key reporting the value `currentValue`
@@ -1091,7 +1149,20 @@ interleaving this plan accepts elsewhere applies here too: a
 still awaiting Homey's response can momentarily reconcile `currentValue`
 back to the pre-write value, since the fetched snapshot doesn't yet
 reflect a write Homey hasn't confirmed — self-corrected moments later
-when that `write()`'s own completion applies its `homeyValue`.
+when that `write()`'s own completion applies its `homeyValue`. The
+narrower case — a `state.get` fetch that started *before* a real
+transition (self-caused or external) and resolves *after* it, so its
+now-stale snapshot overwrites a cache value a realtime event already
+correctly advanced — has the same resolution as the write-vs-write case
+above, not a new one: unlike a dropped realtime event (which has no
+guaranteed future correction), every `state.get` call re-fetches
+directly from Homey, never from this process's own cache, so the very
+*next* `state.get` call — whenever one happens, for any reason, from any
+caller — reconciles from a fresh, accurate fetch regardless of how
+stale the previous one left things. The staleness window this race can
+introduce is bounded by "until the next `state.get` call," the same
+bound the reconciliation mechanism itself exists to guarantee, not left
+open-ended the way a purely realtime-event-driven correction would be.
 
 `devices`/`zones`/`moods`/`users` plus an in-memory `context` object (`{
 machineRoom: null, idle: null, mic: null, media: null }`, updated only by
@@ -1173,12 +1244,11 @@ or verified in `homey-api`'s exposed surface (unlike capability changes,
 which genuinely are push-based), so polling is the honest approach here,
 not a shortcut; 30s balances staleness against hammering the API for a
 row kind that's inherently lower-frequency than capability changes. This
-is a deliberate, narrow exception to design.md's "Explicitly decided
-against: Polling — replaced by `homey-api` realtime events" — that
-decision is about *capability* state, which stays fully push-based and
-unchanged here; notifications are a different data source with no push
-mechanism this research found, and get this one exception rather than
-being dropped from Recent's scope entirely (design.md itself lists
+is the notification exception design.md's own "Explicitly decided
+against: Polling" entry names — capability state stays fully push-based
+and unchanged here; notifications are a different data source with no
+push mechanism this research found, so they poll instead of being
+dropped from Recent's scope entirely (design.md itself lists
 "notifications" as in-scope Discrete content).
 
 ### `core/rpc.mjs` (no structural change)
@@ -1358,6 +1428,24 @@ Add `uchi status`: calls `state.get`, prints `hero.summary`, and if
 this is literally "prints the hero line," phase 2's second done-criterion,
 verbatim.
 
+A plain prompt line (`bin/uchi desk 40`) never calls `state.get` itself
+— only `uchi status` does — so it resolves against whatever `devices`/
+`zones` snapshot the core currently holds, which is fresh only if this
+is the process's first request since startup or since the last
+`state.get`. Phase 1's idle-exit timer (60s of no client connected)
+bounds how stale that snapshot can get in practice: a burst of `bin/uchi`
+invocations issued close enough together to share one still-running core
+process can see a device renamed or added via the Homey app in between
+resolve against the pre-rename snapshot until something calls `state.get`
+again (an intervening `uchi status`, or a future wrapper's own refresh)
+or the core exits idle and the next invocation spawns fresh. Refreshing
+`devices`/`zones` on every `prompt.run` too would close this gap
+completely, at the cost of an extra HTTP round trip on every write —
+directly working against the snappy, one-shot feel `uchi desk 40` (this
+phase's own literal done-criterion) is supposed to have; this plan
+accepts the narrower, bounded staleness instead of paying that cost on
+every single write.
+
 ### `core/test/fixture.mjs` (new)
 The exact fictional house from `docs/design.md`'s "Example prompts"
 section, reused verbatim per that section's own note ("worth reusing again
@@ -1406,7 +1494,9 @@ Against `fixture.mjs`, `node --test`:
   assert a bare `"office"` (no verb/value) resolves to `{ matches: [],
   room: { id: <Office's zone id>, name: "Office" } }`; assert two fixture
   entries sharing an exact name (added to the fixture specifically for
-  this case) resolve as ambiguous `matches`, not an arbitrary pick.
+  this case, in two different zones) resolve as ambiguous `matches`,
+  not an arbitrary pick, with each candidate's `label` zone-qualified
+  and distinct from the other's.
 - Recent: appending a log entry and reading it back renders the expected
   `why`/`line`, including the `dim`/`volume_set` percent-conversion (a
   raw `0.4` entry renders `"40%"`, not `"0.4%"` or `"0.4"`); a
