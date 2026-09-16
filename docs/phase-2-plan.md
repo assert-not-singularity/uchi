@@ -133,11 +133,18 @@ reading the separate shared core config, `~/.config/uchi/config.json`."
 Add `readCoreConfig()`: reads that path (plain `fs.readFileSync`, no
 `O_NOFOLLOW`/mode enforcement — unlike the credentials file, this holds no
 secrets, so the phase-1-only symlink/permission hardening doesn't apply
-here), parses JSON, and returns `{ notches, events, recentRows, people,
-agent }` with defaults for every field so a missing or partial file (or no
-file at all — this config is optional, unlike the credentials file) doesn't
-throw: `{ notches: { light: 10, vol: 5, temp: 1 }, events: {}, recentRows:
-20, people: {}, agent: "off" }`. `notches` is merged one level deep —
+here) wrapped in a `try`/`catch` that treats an `ENOENT` specifically as
+"no file, use every default" — `readFileSync` throws `ENOENT` rather
+than returning anything for a missing path, so without this catch a
+fresh install with no config file yet (the common case: this config is
+optional, unlike the credentials file `readSettings()` requires) would
+throw at startup instead of falling back to defaults. Any other error
+(e.g. malformed JSON) still propagates rather than being silently
+swallowed as if it were a missing file. On success, parses JSON and
+returns `{ notches, events, recentRows, people, agent }` with defaults
+for every field so a missing or partial file doesn't throw: `{ notches:
+{ light: 10, vol: 5, temp: 1 }, events: {}, recentRows: 20, people: {},
+agent: "off" }`. `notches` is merged one level deep —
 `{ ...defaults.notches, ...(parsed.notches ?? {}) }` — not replaced
 wholesale, so a file that sets only `notches.light` still gets the real
 defaults for `notches.vol`/`notches.temp` instead of leaving them
@@ -526,13 +533,24 @@ parser, nothing wider yet.
      action: { deviceId, capabilityId, value } }` — `value` is `true`
      for `on`/`lock`, `false` for `off`/`unlock`. Anything else in `rest`
      is parsed as a bare number.
-  5. A bare number in `rest` is only accepted if `Number(rest)` is finite
-     (rejects `NaN` from something like `"desk abc"` and rejects
-     `Infinity`/`-Infinity`) — checked before anything below runs, since
-     an ordinary `min`/`max` comparison never rejects `NaN` on its own
-     (`NaN < min` and `NaN > max` are both `false`), so without this
-     check a non-numeric `rest` would pass the range check further down
-     as if it were in range and reach `setCapabilityValue` with `NaN`. A
+  5. A bare number in `rest` requires `rest.trim()` to be non-empty
+     *and* `Number(rest.trim())` to be finite — checked in that order,
+     before anything below runs. Both checks matter for a different
+     reason: `Number("")` (and `Number("   ")`) is `0`, not `NaN`, so a
+     device-only query with nothing after it (`"desk"` with no verb or
+     value) would otherwise silently fall through the empty-string
+     check and resolve as if `"desk 0"` had been typed, writing a
+     dimmable light to zero instead of doing nothing — the non-empty
+     check is what makes a bare device name (no verb, no number) its own
+     defined dead end, `matches: [{ label: thing.name, why: "needs a
+     verb or number" }]`, symmetric to a bare *zone* name's defined
+     `{ room }` result above, rather than an accident of what `Number()`
+     happens to coerce an empty string to. Separately, an ordinary
+     `min`/`max` comparison never rejects `NaN` on its own (`NaN < min`
+     and `NaN > max` are both `false`), so a non-empty but non-numeric
+     `rest` (`"desk abc"`) still needs its own finite check before the
+     range check further down, or it would pass the range check as if
+     it were in range and reach `setCapabilityValue` with `NaN`. A
      non-finite `rest` is a dead end, `matches: [{ label: thing.name,
      why: "needs a number" }]` — the "one consistent contract" above
      still holds: this is a `matches`-shaped dead end like any other, not
@@ -652,19 +670,55 @@ priority order itself is the same one `grammar.mjs`'s bare-number step
 already checks value-bearing capabilities in, with `onoff`/`locked`
 appended after as the two verb-only fallbacks for a device with none of
 the three value targets. `why` is that capability's current value,
-`toDisplayPercent()`-converted for `dim`/`volume_set` (e.g. `"40%"`),
-plain for `target_temperature` (e.g. `"21°"`), and
-`"on"`/`"off"`/`"locked"`/`"unlocked"` for the boolean pair; `line` is
-the same `toLinePercent()`-based undo-style line `recent.mjs` builds for
-a re-apply of that one chosen capability, reusing
-that formatting logic — factor the shared from-value → line renderer
-into `grammar.mjs` so `here.mjs` and `recent.mjs` don't duplicate it, and
-apply `recent.mjs`'s same rule of omitting `line` for a capability
-grammar can't write (moot here in practice, since all five capabilities
-in the priority order above are ones `grammar.mjs` can write, by
-construction — they're the same five, not a coincidence).
+formatted via one shared `grammar.mjs` function, `formatCapabilityWhy(
+capabilityId, value)` — `toDisplayPercent()`-converted for `dim`/
+`volume_set` (e.g. `"40%"`), plain for `target_temperature` (e.g.
+`"21°"`), and `"on"`/`"off"`/`"locked"`/`"unlocked"` for the boolean pair
+— that `rpc.mjs`'s `prompt.resolve` handler also calls (below), rather
+than each duplicating the same five-capability formatting; `line` is the
+same `toLinePercent()`-based undo-style line `recent.mjs` builds for a
+re-apply of that one chosen capability, reusing that formatting logic —
+factor the shared from-value → line renderer into `grammar.mjs` so
+`here.mjs` and `recent.mjs` don't duplicate it, and apply `recent.mjs`'s
+same rule of omitting `line` for a capability grammar can't write (moot
+here in practice, since all five capabilities in the priority order
+above are ones `grammar.mjs` can write, by construction — they're the
+same five, not a coincidence).
+
+### `core/bounce.mjs` (new)
+A small, side-effect-free module holding exactly one export,
+`bounceStep(pending, from, to, ts)` — the pure cancel-or-commit decision
+`core/index.mjs`'s `onChange` handler needs (below) for its bounce
+buffer. Kept out of `index.mjs` specifically so it has no top-level code
+that runs on import: `index.mjs`'s own `main()` connects to Homey and
+runs unconditionally the moment that module loads (phase 1's existing
+entrypoint, unchanged), so `bounceStep` living there would make it
+untestable without also triggering a real connection attempt.
+`bounceStep` takes no `Map`, no timer, and no device — just the
+previous pending entry (or `null`) and the incoming transition — and
+returns `{ commit, pending }`, each either `null` or a `{ from, to, ts }`
+record: `commit` is what the caller should immediately hand to
+`log.append` (or `null` if there's nothing to commit yet), `pending` is
+what the caller should store as the new `pendingTransition` entry for
+this key (or `null` once a bounce has cancelled it out). `index.mjs`
+owns the `Map`, the `alarm_contact`/`alarm_motion` going-true filter,
+and the 2-second timer that calls back into this function when a
+pending entry times out uncontested — `bounce.mjs` itself knows nothing
+about timers, Homey, or any specific capability.
 
 ### `core/index.mjs` (extend)
+The very first thing this extended `main()` does, before even calling
+`connect(settings)`, is capture `const startupCutoff = Date.now()` —
+notification polling (below) needs this value once it starts, but
+capturing it only right before the polling loop starts would leave out
+however long the Homey connection and the devices/zones/moods/users
+fetch below take: a notification created during that window would
+already be older than a cutoff captured after it, and would be wrongly
+classified as pre-existing history instead of a genuinely new,
+current-process notification. Capturing it as the literal first
+statement in `main()` is what makes "before core initialization" mean
+the actual process start, not just "before the polling loop specifically."
+
 The existing `try { const api = await connect(settings); deviceCount =
 await getDeviceCount(api); } catch { ...; process.exit(69); }` declares
 `api`/`deviceCount` with `const` scoped to that `try` block — fine in
@@ -728,7 +782,23 @@ needs to be current *between* `state.get` calls:
   fallback: a few seconds after it's created, remove it regardless of
   `remaining`, in case fewer than two echoes ever arrive for some reason
   — a stale record that's never removed would incorrectly swallow a
-  later *genuine* external write to the same value. Records are pushed
+  later *genuine* external write to the same value. Matching by value is
+  a documented, accepted best-effort limitation, not a proof of
+  causation: an external write landing on the exact same value while a
+  self-write's expectation is still queued (e.g. a physical switch
+  toggled to the value `prompt.run` was already setting) is
+  indistinguishable from the real echo and gets consumed by it, and the
+  genuine echo that follows can then be misattributed as external.
+  `makeCapabilityInstance`'s listener (`homey.mjs`'s
+  `subscribeToDiscreteChanges`, above) exposes only `value` to `onChange`
+  — not the raw socket event's `transactionId`/`transactionTime`
+  (verified in the Context section above) — so there's no correlation
+  ID available at this layer to disambiguate the two; this only affects
+  `cause`/`"(you)"` attribution for that one rare, narrow interleaving,
+  never the recorded `from`/`to` values themselves, and design.md
+  already treats cause as descriptive flavor, not something downstream
+  depends on structurally (see "Deferred past this phase"). Records are
+  pushed
   *before* the write they belong to is issued (below), which is what
   makes matching against this queue safe against an echo arriving before
   `rpc.mjs` has even called `log.append` for the prompt-caused write — a
@@ -759,14 +829,23 @@ needs to be current *between* `state.get` calls:
   fresh pending entry for `Y → newValue` with a newly captured `ts` (if
   not), as detailed under `core/log.mjs` above. That cancel-or-commit
   decision is a pure function of the pending entry and the incoming
-  value — it needs no timer or real subscription to run — so it's
-  factored out as `index.mjs`'s own exported `bounceStep(pending, from,
-  to, ts)`, returning `{ commit: { from, to, ts } | null, pending: {
-  from, to, ts } | null }`; the `onChange` callback calls it and acts on
-  the result (clearing/replacing the `pendingTransition` map entry,
-  scheduling or clearing the 2-second timer), but the decision itself is
-  directly callable from a test with no timers or fake realtime
-  callbacks involved (see `core/test/index.test.mjs` below). **Every**
+  value — it needs no timer, no realtime subscription, and no Homey
+  connection to run — so it lives in its own new, side-effect-free
+  module, `core/bounce.mjs`, as `bounceStep(pending, from, to, ts)`,
+  returning `{ commit: { from, to, ts } | null, pending: { from, to, ts
+  } | null }`. It doesn't live in `index.mjs` itself: `index.mjs`'s
+  `main()` connects to Homey and runs unconditionally on module load
+  (phase 1's existing entrypoint pattern, unchanged), so a test
+  importing anything from `index.mjs` directly would trigger a real
+  connection attempt (and phase 1's `exit(69)` on failure) before the
+  test itself ever runs — a separate module with no top-level side
+  effects is what makes `bounceStep` importable from a test in
+  isolation. `index.mjs`'s `onChange` callback imports `bounceStep` from
+  `core/bounce.mjs` and acts on its result (clearing/replacing the
+  `pendingTransition` map entry, scheduling or clearing the 2-second
+  timer); `core/test/bounce.test.mjs` (below) imports the same function
+  from the same module, directly, no timers or fake realtime callbacks
+  involved. **Every**
   transition
   reaches this step, including an `alarm_contact`/`alarm_motion` value
   going back to `false` — bounce-tracking has to see the real sequence
@@ -872,15 +951,15 @@ point (that's what the earlier `exit(69)` gate already guarantees), so
 an outage in specifically the notifications endpoint must not delay
 `state.get`/`prompt.run` becoming available at all.
 
-Before the loop starts, capture `const startupCutoff = Date.now()` once
-— at core initialization, not inside the loop body — and reuse this same
-value for whichever attempt turns out to be the seed call. Capturing it
-fresh on every attempt instead would let a failed first fetch push the
-cutoff later on each retry: a notification created right after core
-startup but before a slow or retried connection finally succeeds would
-then satisfy `dateCreated <= cutoff` against that later value and get
-silently seeded as pre-existing history, never shown, despite genuinely
-falling inside this process's own current-process window.
+The one `startupCutoff` captured at the top of `main()` (above) is
+reused for whichever polling attempt turns out to be the seed call —
+never recaptured inside the loop. Capturing it fresh on every attempt
+instead would let a failed first fetch push the cutoff later on each
+retry: a notification created right after core startup but before a
+slow or retried connection finally succeeds would then satisfy the
+seed comparison against that later value and get silently seeded as
+pre-existing history, never shown, despite genuinely falling inside
+this process's own current-process window.
 
 The polling itself is one recursive `setTimeout` loop, not a bare
 `setInterval`, with a module-level `notificationsSeeded` boolean guard
@@ -890,15 +969,19 @@ slow fetch still in flight when the next retry fires) from each
 independently succeeding and each seeding/starting their own polling
 cadence. The loop's body: call `homey.getNotifications(api)`; on
 success, if `notificationsSeeded` is still `false`, this is the seed
-call — mark every returned entry whose `dateCreated <= startupCutoff`
-(the value captured once, above) as seen via
-`log.seedNotificationIds(...)` (established history, not appended), and
-`log.appendNotification(...)` any entry whose `dateCreated >
-startupCutoff` (genuinely created after core startup, not pre-core
-history — appending it, not just seeding it, is what keeps a
-notification created in that narrow window from being silently absorbed
-into the baseline and never shown), then set `notificationsSeeded =
-true` and schedule the next call in `30_000` ms. If `notificationsSeeded` is already `true` (this is an ordinary
+call — for each returned entry, compute `entryTime =
+Date.parse(entry.dateCreated)` (Homey's `dateCreated` is an ISO string;
+`startupCutoff` is `Date.now()`'s numeric milliseconds-since-epoch, so
+comparing the raw string against it directly would compare a string to
+a number and produce `NaN`-driven comparisons that are never true,
+misclassifying every entry as newer than the cutoff) — mark the entry
+seen via `log.seedNotificationIds(...)` (established history, not
+appended) if `entryTime <= startupCutoff`, or `log.appendNotification(
+...)` it if `entryTime > startupCutoff` (genuinely created after core
+startup, not pre-core history — appending it, not just seeding it, is
+what keeps a notification created in that narrow window from being
+silently absorbed into the baseline and never shown), then set
+`notificationsSeeded = true` and schedule the next call in `30_000` ms. If `notificationsSeeded` is already `true` (this is an ordinary
 ongoing poll, not the seed), just `appendNotification` any entry whose
 `id` isn't already in the seen set, as before, and schedule the next
 call in `30_000` ms. On failure: log the error via `console.error` and
@@ -995,11 +1078,18 @@ in `index.mjs`:
   `devices[action.deviceId].name` (synchronous, no `await` in between —
   unlike the write path below, there's no in-flight-write window here
   for `devices` to go stale under) and replies `{ matches: [{ label,
-  line: params.text }] }`: `params.text` is already a valid line for
-  this exact write, since resolving it to an `action` at all means it
-  unambiguously names one, so a live wrapper's Enter/Tab can send the
-  original text straight back through `prompt.run` with nothing to
-  reconstruct. Any other case (ambiguous, no match, or one of
+  line: params.text, why }] }` — the documented shape requires `why` on
+  every match, not just the ambiguous/dead-end ones, so this branch
+  can't omit it either. `why` here is `grammar.mjs`'s own
+  `formatCapabilityWhy(action.capabilityId, action.value)` — the same
+  shared function `here.mjs`'s per-device row calls to format a
+  capability's current value (above), not a second copy of the same
+  five-capability formatting duplicated in `rpc.mjs`. `params.
+  text` is already a valid line for this exact write, since resolving it
+  to an `action` at all means it unambiguously names one, so a live
+  wrapper's Enter/Tab can send the original text straight back through
+  `prompt.run` with nothing to reconstruct. Any other case (ambiguous, no
+  match, or one of
   `resolve()`'s single-candidate dead ends) is already `{ matches: [...]
   }` with no `action` or `room` present, and needs no translation.
 - `prompt.run` → `await`s `grammar.run(params.line, { devices, zones,
@@ -1088,7 +1178,7 @@ network and no real Homey — this is what makes those modules unit-testable
 the same way phase 1 made `rpc.mjs` unit-testable against a plain dispatch
 table.
 
-### `core/test/grammar.test.mjs`, `core/test/recent.test.mjs`, `core/test/here.test.mjs`, `core/test/index.test.mjs` (new)
+### `core/test/grammar.test.mjs`, `core/test/recent.test.mjs`, `core/test/here.test.mjs`, `core/test/bounce.test.mjs` (new)
 Against `fixture.mjs`, `node --test`:
 - Grammar: `"desk 40"` resolves to `{ matches: [], action: { deviceId:
   <Desk Lamp's id>, capabilityId: "dim", value: 0.4 } }` (design.md's own
@@ -1102,14 +1192,15 @@ Against `fixture.mjs`, `node --test`:
   assert that a query naming a multi-kind zone (Living Room: lights +
   speaker + thermostat) with a bare number returns the "needs a word"
   dead end, not a guess; assert `"front door unlock"` (design.md's own
-  example, with the verb — a bare device name with no verb/value has no
-  defined resolution in phase 2 and isn't tested as if it did) resolves
-  to `{ matches: [], action: { deviceId: <Front Door's id>,
-  capabilityId: "locked", value: false } }`; assert a bare `"office"`
-  (no verb/value) resolves to `{ matches: [], room: { id: <Office's zone
-  id>, name: "Office" } }`; assert two fixture entries sharing an exact
-  name (added to the fixture specifically for this case) resolve as
-  ambiguous `matches`, not an arbitrary pick.
+  example, with the verb) resolves to `{ matches: [], action: { deviceId:
+  <Front Door's id>, capabilityId: "locked", value: false } }`; assert a
+  bare `"front door"` (a device with no verb or value) resolves to the
+  "needs a verb or number" dead end, not `"front door 0"`'s effect — the
+  regression test for `Number("")` coercing to `0` instead of `NaN`;
+  assert a bare `"office"` (no verb/value) resolves to `{ matches: [],
+  room: { id: <Office's zone id>, name: "Office" } }`; assert two fixture
+  entries sharing an exact name (added to the fixture specifically for
+  this case) resolve as ambiguous `matches`, not an arbitrary pick.
 - Recent: appending a log entry and reading it back renders the expected
   `why`/`line`, including the `dim`/`volume_set` percent-conversion (a
   raw `0.4` entry renders `"40%"`, not `"0.4%"` or `"0.4"`); a
@@ -1118,15 +1209,18 @@ Against `fixture.mjs`, `node --test`:
   as `{label: ownerName, why: excerpt}` with no `line`; appending the
   same notification `id` twice (simulating a re-poll) doesn't duplicate
   the row; `seedNotificationIds` followed by `appendNotification` for
-  one of those same ids appends nothing. (The self-write-echo registry,
-  the serialized `write()` function, and bounce-tracking all live in
-  `core/index.mjs`, not `log.mjs`/`recent.mjs` — see `index.test.mjs`
-  below for bounce-tracking, and the live verification steps below for
-  the self-write-echo registry, which needs a real realtime connection
-  to echo anything back.)
-- Index: `bounceStep(pending, from, to, ts)` (the pure bounce-decision
-  helper `core/index.mjs` exports, above) directly, no timers or fixture
-  devices needed — an `A → B` call with no pending entry returns `{
+  one of those same ids appends nothing. (The self-write-echo registry
+  and the serialized `write()` function live in `core/index.mjs`, not
+  `log.mjs`/`recent.mjs`, and need a real realtime connection to echo
+  anything back — exercised by the live verification steps below, not a
+  fixture unit test. Bounce-tracking's decision logic lives in
+  `core/bounce.mjs` instead, precisely so it doesn't share that
+  limitation — see `bounce.test.mjs` below.)
+- Bounce: `bounceStep(pending, from, to, ts)` (the pure bounce-decision
+  helper `core/bounce.mjs` exports, above), imported directly from that
+  module — not from `core/index.mjs`, which would run `main()` on import
+  — no timers or fixture devices needed — an `A → B` call with no
+  pending entry returns `{
   commit: null, pending: { from: A, to: B, ts } }`; a second call for the
   same key with that pending entry and `to === A` (the bounce) returns
   `{ commit: null, pending: null }` — cancelled, nothing to show; a
@@ -1145,8 +1239,9 @@ Against `fixture.mjs`, `node --test`:
 
 ## Verification (run these, in order)
 
-1. `cd core && node --test` — all of phase 1's existing test plus the three
-   new suites above, against the fixture, no real Homey needed.
+1. `cd core && node --test` — all of phase 1's existing test plus the four
+   new suites above (grammar, recent, here, bounce), against the fixture,
+   no real Homey needed.
 2. `bin/uchi status` against the real core (already running per phase 1's
    verification) — must print the aggregate summary line; with no
    `context.set` ever sent (true for a bare CLI session), `hero.room` is
