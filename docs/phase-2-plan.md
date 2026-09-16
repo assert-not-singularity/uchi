@@ -40,7 +40,12 @@ locally, not assumed from the design doc's or the artifact's prose:
   `speaker`, `lock`, `sensor`, `fan`, `tv`, `button`, `remote`, `bridge`,
   `other` — all seen live), `capabilities` (a flat array of capability-id
   strings), `capabilitiesObj` (a map of that same id to `{value, type,
-  getable, setable, title, titleShort, lastUpdated, units}`). Real capability
+  getable, setable, title, titleShort, lastUpdated, units, min, max}` —
+  `min`/`max` are only present on a numeric capability, `undefined` on a
+  boolean one like `onoff`/`locked`, and are exactly the fields the
+  bare-number range check below reads, so the fixture (below) must
+  record real `min`/`max` values on its numeric capabilities, not just
+  the fields already needed for percent-conversion). Real capability
   ids are **not** all clean/simple — this house alone has vendor-specific
   ones (`homematic_thermostat_boost`, `lv131sCapability`) and
   driver-namespaced ones (`measure_temperature.temperature_sensor_raspberry_pi`,
@@ -159,10 +164,20 @@ merged one level deep — `{ ...defaults.notches, ...(parsed.notches ??
 {}) }` — not replaced
 wholesale, so a file that sets only `notches.light` still gets the real
 defaults for `notches.vol`/`notches.temp` instead of leaving them
-`undefined`; every other top-level field (`recentRows`, `agent`, `people`,
-`events`) has no nested shape phase 2 reads into, so a plain top-level
-default is enough for those. Phase 2 only *consumes* `recentRows` (in
-`recent.mjs`, below); `notches` is read and stored now so the notch grammar
+`undefined`; every other top-level field (`agent`, `people`, `events`)
+has no nested shape phase 2 reads into, so a plain top-level default is
+enough for those. `recentRows` gets one more check beyond a plain
+default, since it's the one field phase 2 actually uses as a number
+(below): normalized to a finite non-negative integer, capped at 500,
+falling back to the default `20` for anything else — `Array.prototype.
+slice`'s own permissiveness is the reason this matters, not a
+hypothetical: `entries.slice(0, recentRows)` with a config value of
+`-1` returns all but the last entry rather than none, and a non-numeric
+value like a stray string is silently coerced by the comparison this
+normalization replaces, so a malformed config could otherwise bypass
+the row limit entirely instead of falling back to a sane default. Phase
+2 only *consumes* `recentRows` (in `recent.mjs`, below); `notches` is
+read and stored now so the notch grammar
 form (`++`/`--`) has a config value to read once it's implemented, without
 a second config-reading pass; `events`/`people`/`agent` are read but unused
 until phases 4–6 — reading them now costs nothing and avoids a schema
@@ -302,19 +317,15 @@ restart is sufficient and avoids designing a durable log format twice.
 Revisit this file when phase 5 actually needs persistence.
 
 - `append(entry)` — a capability entry is `{ id, ts, kind: "capability",
-  deviceId, deviceName, capabilityId, from, to, cause }`. `ts` is
-  optional on the `entry` passed in: `append` uses `entry.ts` when the
-  caller supplies one, and defaults to `Date.now()` otherwise. A
-  realtime transition committed out of `core/index.mjs`'s bounce buffer
-  (below) always supplies its own captured `ts` — the moment the
-  transition was first observed, not the later moment its up-to-2-second
-  bounce window finally commits it — since `recent.mjs`'s `list()`
-  (below) sorts by `ts` and a commit-time stamp would misorder a
-  bounce-delayed row against ones that arrived after it but weren't
-  themselves delayed. A `prompt.run`-caused write (see `rpc.mjs` below)
-  has no such delay — the write and the `append` call happen at the same
-  moment — so it omits `ts` and takes the default. `id` is a
-  process-local counter `log.mjs` mints and assigns here — a capability
+  deviceId, deviceName, capabilityId, from, to, cause }`. `append` always
+  assigns `ts: Date.now()` itself — every capability entry is appended
+  the moment `core/index.mjs` decides it's worth keeping, whether that's
+  a real transition observed via `subscribeToDiscreteChanges` or a
+  `prompt.run`-caused write (see `rpc.mjs` below), so append time and
+  event time are the same instant in both cases; there's no delayed or
+  buffered path that would need a caller-supplied `ts` to stay accurate.
+  `id` is a process-local counter `log.mjs` mints and assigns here — a
+  capability
   entry has no natural id of its own (a device/capability/timestamp
   triple isn't guaranteed unique against rapid repeated writes) — while
   a notification entry (below) keeps Homey's own real `id` unchanged
@@ -337,21 +348,23 @@ Revisit this file when phase 5 actually needs persistence.
   `from === to` — a write that lands on the value it already had is not
   a transition, and this guard is what actually makes a redundant prompt
   write (e.g. dimming a light already at 40% to 40%) produce no Recent
-  row.
+  row. This dedupe is specific to `append`'s own capability-entry shape
+  and never runs for `appendNotification` (below): a notification entry
+  has no `from`/`to` fields at all, so if the two functions shared this
+  check, every notification would satisfy `from === to` as `undefined
+  === undefined` and get silently dropped — `append` and
+  `appendNotification` push to the same underlying buffer but are two
+  separate functions with two separate entry-acceptance rules, not one
+  function branching on `kind`.
 
-  `log.mjs` itself is otherwise a plain buffer: neither the self-write
-  echo nor the bounce is decided here. Both are realtime-event policy —
-  deciding whether a given raw transition is noise at all, before it
-  ever becomes a candidate `append` call — and both live in
-  `core/index.mjs`'s `onChange` handler (below), which is the one place
-  that sees every raw transition for a key in order; `append` only ever
-  receives entries `index.mjs` has already decided are worth keeping.
-  Keeping that decision out of `log.mjs` is also what lets the bounce
-  window correctly observe a capability's *every* value (including one
-  `onChange` will end up filtering from Recent, like `alarm_contact`
-  going back to `false`) rather than only the subset `log.mjs` would
-  otherwise be shown — see `core/index.mjs` for why that distinction
-  matters.
+  `log.mjs` itself is otherwise a plain buffer: the self-write echo
+  check and the `alarm_contact`/`alarm_motion` "going true" filter are
+  both realtime-event policy — deciding whether a given raw transition
+  is noise at all, before it ever becomes a candidate `append` call —
+  and both live in `core/index.mjs`'s `onChange` handler (below), which
+  is the one place that sees every raw transition for a key in order;
+  `append` only ever receives entries `index.mjs` has already decided
+  are worth keeping.
 - `appendNotification(entry)` — same buffer, `kind: "notification"`
   (`{ ts, kind: "notification", id, ownerName, excerpt }`, `id` real and
   Homey's own; `ts` is `Date.parse(entry.dateCreated)` — Homey's own
@@ -382,15 +395,17 @@ Revisit this file when phase 5 actually needs persistence.
   same seen set, not a special-cased call to the first one.
 - `tail(n)` — the last `n` entries of either kind, in **append** order
   (newest-appended first), not necessarily chronological (`ts`) order.
-  Those two can differ here specifically because a bounce-delayed
-  transition (above) commits up to 2 seconds after its own `ts`, so a
-  capability change that arrived *after* it chronologically but wasn't
-  itself delayed can already be appended by the time the delayed one
-  finally commits — `tail(n)` still returns it in the order it landed in
-  the array. `core/recent.mjs`'s `list()` (below) is what sorts by `ts`
-  before rendering, so "newest first" in the row list callers actually
-  see is a real chronological ordering, not `log.mjs`'s raw append
-  order.
+  Those two can differ specifically for notification entries: a
+  notification's `ts` is Homey's own `dateCreated` (above), not the
+  moment this process happened to poll and append it, and the 30-second
+  poll cadence means a notification can land in the buffer well after
+  its own `ts` — interleaved with capability entries whose `ts` is
+  always their real append time, since nothing delays a capability
+  entry's `append` call (see `append` above). `tail(n)` still returns
+  entries in the order they landed in the array; `core/recent.mjs`'s
+  `list()` (below) is what sorts by `ts` before rendering, so "newest
+  first" in the row list callers actually see is a real chronological
+  ordering, not `log.mjs`'s raw append order.
 
 ### `core/recent.mjs` (new)
 Derives Recent rows from `log.mjs`'s buffer, per design.md's Recent
@@ -406,12 +421,12 @@ extra ceremony, it's what makes "tested against a recorded house fixture,
 no real Homey" (this phase's own stated goal) actually true for this file:
 
 - `list()` sorts by `ts` descending before taking the top `recentRows`,
-  not by `tail()`'s raw append order — `log.mjs`'s bounce handling
-  (above) can commit a transition up to 2 seconds after its own `ts`, by
-  which point a later, undelayed transition may already be appended
-  ahead of it; sorting by `ts` here is what keeps "newest first" true to
-  actual event time rather than to whichever order things happened to
-  land in the buffer.
+  not by `tail()`'s raw append order — a notification's `ts` is Homey's
+  own `dateCreated`, not this process's poll time, so a notification can
+  land in the buffer after capability entries whose real `ts` is later
+  than its own (see `log.mjs`'s `tail()` above); sorting by `ts` here is
+  what keeps "newest first" true to actual event time rather than to
+  whichever order things happened to land in the buffer.
 - One row per log entry (no mood/flow-fold grouping yet — folding requires
   knowing *which* entries share a mood/flow cause, and phase 2 has no
   mood/flow attribution at all per the cause-tracking limitation above;
@@ -444,7 +459,23 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   `toDisplayPercent()`) for `dim`/`volume_set`, since this text is meant
   to be typed back in and executed, and rounding it to a whole percent
   the way `why` does would make the "undo" land on a different value
-  than the one it's supposed to restore. Every other member of
+  than the one it's supposed to restore. This line is executable only if
+  the device that produced it still has exactly one setable capability
+  among `dim`/`target_temperature`/`volume_set` at the moment it's run —
+  `grammar.mjs`'s own ambiguity rule for a bare number (above) — which
+  `recent.mjs` has no way to check itself: it deliberately renders from
+  log entries alone, with no `devices` map (`deviceName` already has to
+  travel with the entry as a snapshot for the same reason, above).
+  Confirmed empirically against this real house: no real device here has
+  more than one of these three `setable` at once (see `grammar.mjs`'s
+  own bare-number step above), so this is a documented, accepted
+  limitation for a case that doesn't occur in the verified target
+  environment, not a gap this phase adds machinery to close — a device
+  that did gain a second numeric target later (or in a different house)
+  would still show an undo line here that could resolve as `"needs a
+  word"` if run, the same way a device renamed since the entry was
+  logged can make an undo line resolve differently than intended (below).
+  Every other member of
   `DISCRETE_CAPABILITIES` — `speaker_playing` (`setable`, but phase 2's
   grammar has no play/pause verb), `alarm_contact`/`alarm_motion`
   (`getable`-only, not writable at all), `windowcoverings_state` (no verb
@@ -688,63 +719,50 @@ not 6.
 Each surviving device is rendered as `{ id, label, why, line }` matching
 the row contract every section uses. A device can have more than one of
 the five controllable capabilities at once — an ordinary light has both
-`onoff` and `dim` — so `why`/`line` pick the **first capability that is
-both present *and* `setable`** in a fixed priority order, `dim` >
-`target_temperature` > `volume_set` > `onoff` > `locked`: checking
-presence alone isn't enough, the same reasoning as `grammar.mjs`'s
-`setable` check above — a device could in principle have a read-only
-`dim` (reporting brightness without controlling it) alongside a genuinely
-`setable` `onoff`, and presence-only selection would then choose the one
-capability that can't actually be written, producing a `line` `prompt.run`
-would reject. The zone-level `setable` filter above only guarantees *some*
-capability among the five is controllable, not that it's the
-highest-priority one present, so this second, per-capability `setable`
-check is a distinct, necessary step, not a restatement of the first. The
-priority order itself is the same one `grammar.mjs`'s bare-number step
-already checks value-bearing capabilities in, with `onoff`/`locked`
-appended after as the two verb-only fallbacks for a device with none of
-the three value targets. `why` is that capability's current value,
-formatted via one shared `grammar.mjs` function, `formatCapabilityWhy(
-capabilityId, value)` — `toDisplayPercent()`-converted for `dim`/
-`volume_set` (e.g. `"40%"`), plain for `target_temperature` (e.g.
-`"21°"`), and `"on"`/`"off"`/`"locked"`/`"unlocked"` for the boolean pair
-— that `rpc.mjs`'s `prompt.resolve` handler also calls (below), rather
-than each duplicating the same five-capability formatting; `line` is the
-same `toLinePercent()`-based undo-style line `recent.mjs` builds for a
-re-apply of that one chosen capability, reusing that formatting logic —
-factor the shared from-value → line renderer into `grammar.mjs` so
-`here.mjs` and `recent.mjs` don't duplicate it, and apply `recent.mjs`'s
-same rule of omitting `line` for a capability grammar can't write (moot
-here in practice, since all five capabilities in the priority order
-above are ones `grammar.mjs` can write, by construction — they're the
-same five, not a coincidence).
-
-### `core/bounce.mjs` (new)
-A small, side-effect-free module holding exactly one export,
-`bounceStep(pending, from, to, ts)` — the pure cancel-or-commit decision
-`core/index.mjs`'s `onChange` handler needs (below) for its bounce
-buffer. Kept out of `index.mjs` specifically so it has no top-level code
-that runs on import: `index.mjs`'s own `main()` connects to Homey and
-runs unconditionally the moment that module loads (phase 1's existing
-entrypoint, unchanged), so `bounceStep` living there would make it
-untestable without also triggering a real connection attempt.
-`bounceStep` takes no `Map`, no timer, and no device — just the
-previous pending entry (or `null`) and a genuinely new incoming
-transition — and returns `{ commit, pending }`, each either `null` or a
-`{ from, to, ts }` record: `commit` is a pending entry the new
-transition immediately displaced (or `null` if there's nothing to
-commit yet), which the caller still has to run through the
-`alarm_contact`/`alarm_motion` going-true filter before `log.append`,
-not hand to it directly; `pending` is what the caller should store as
-the new `pendingTransition` entry for this key (or `null` once a bounce
-has cancelled it out). `bounceStep` is called only when a new, distinct
-value actually arrives — the separate case of a pending entry's
-2-second timer expiring with nothing new having happened at all isn't a
-`bounceStep` call (there's no new transition to pass it), it's
-`index.mjs`'s own `flushPending(key)` glue committing the stored record
-directly (see `core/index.mjs` below). `index.mjs` owns the `Map`, the
-going-true filter, and the 2-second timer; `bounce.mjs` itself knows
-nothing about timers, Homey, logging, or any specific capability.
+`onoff` and `dim` — so picking one needs two passes, not one flat
+priority order over all five: first, `numericTargets` — the device's
+present-*and*-`setable` capabilities among `dim`/`target_temperature`/
+`volume_set` — is computed exactly the way `grammar.mjs`'s bare-number
+step (above) does, because that's the whole point: `grammar.mjs` only
+accepts a bare number when a device has **exactly one** of these three,
+so a `line` built from a different assumption could name a capability
+that same input would actually reject as `"needs a word"`. If
+`numericTargets.length === 1`, that capability is the pick for both
+`why` and `line` — the ordinary case, and the only one where a numeric
+`line` is safe to offer at all. Otherwise (zero or more than one
+numeric target — a device with, say, both `dim` and
+`target_temperature` setable would otherwise let this row's `dim` pick
+generate `"<device> 40"`, which `grammar.mjs` would reject as ambiguous
+the moment `prompt.run` tried to execute it, not the working undo the
+row promises), the pick falls through to `onoff` then `locked` instead
+— checked in that order for present-*and*-`setable`, the first match
+wins for both `why` and `line`. Verbs don't have the three-way ambiguity
+numbers do: typing `"on"` only ever names `onoff` and `"lock"` only ever
+names `locked`, so a device having both `onoff` and `locked` setable
+creates no comparable conflict — each verb's own word already picks its
+capability, independent of the other. If neither `onoff` nor `locked`
+is present and setable either (a device whose only controllable
+capabilities are two or more ambiguous numeric targets — the zone-level
+`setable` filter above guarantees *some* capability among the five, not
+that it resolves to an executable line), `why` still uses `
+numericTargets[0]`'s current value, so the row isn't blank, but `line`
+is omitted — the same "no `line` for a capability `grammar.mjs` can't
+write this way" rule `recent.mjs` already applies for its own undo
+lines (below), applied here for the same underlying reason: an
+ambiguous numeric target and a capability grammar.mjs doesn't recognize
+at all are both cases where no line phase 2's own grammar could ever
+run, not merely a capability grammar.mjs hasn't gotten to yet. `why` is
+the picked capability's current value, formatted via one shared
+`grammar.mjs` function, `formatCapabilityWhy(capabilityId, value)` —
+`toDisplayPercent()`-converted for `dim`/`volume_set` (e.g. `"40%"`),
+plain for `target_temperature` (e.g. `"21°"`), and `"on"`/`"off"`/
+`"locked"`/`"unlocked"` for the boolean pair — that `rpc.mjs`'s
+`prompt.resolve` handler also calls (above), rather than each
+duplicating the same five-capability formatting; `line`, when present,
+is the same `toLinePercent()`-based undo-style line `recent.mjs` builds
+for a re-apply of the picked capability, reusing that formatting logic
+— factor the shared from-value → line renderer into `grammar.mjs` so
+`here.mjs` and `recent.mjs` don't duplicate it.
 
 ### `core/index.mjs` (extend)
 The very first thing this extended `main()` does, before even calling
@@ -845,104 +863,45 @@ needs to be current *between* `state.get` calls:
   check against the log's own tail instead would be racy exactly in that
   window.
 - If the incoming event does **not** match a queued self-write, it's an
-  externally-caused event: the callback now sets `currentValue` for that
-  key to the new value (and bumps that key's `cacheVersion` — see
-  `write()`'s race-guard below) — before any *logging* filtering, though
-  after the self-echo check above — and only *then* decides whether to
-  log anything. Updating the cache before the logging filter, not after,
-  is what keeps a later `alarm_contact`/`alarm_motion` "going true"
+  externally-caused event: the callback sets `currentValue` for that key
+  to the new value — before any *logging* filtering, though after the
+  self-echo check above — and only *then* decides whether to log
+  anything. Updating the cache before the logging filter, not after, is
+  what keeps a later `alarm_contact`/`alarm_motion` "going true"
   comparison correct: filtering `false` transitions out of `onChange`'s
   *logging* behavior must not also filter them out of what the cache
   remembers, or a `true → false → true` sequence would see the second
   `true` as a no-op against a cache stuck on the first `true`, and lose a
-  real Recent row. If the new value equals the `from` captured above,
-  this is a **duplicate, non-self callback** — Homey can fire `onChange`
-  more than once for the same value independent of the two-echo
-  self-write case above, and this one isn't a self-write's echo (it
-  already failed the `pendingSelfWrites` check) — and bounce-tracking is
-  skipped entirely for it: no `bounceStep` call, no change to whatever
-  `pendingTransition` entry or timer already exists for the key. Feeding
-  a no-op transition into `bounceStep` would make it indistinguishable
-  from a genuine new change: with a pending `A → B` already buffered, a
-  duplicate `B` callback would commit `A → B` early and start a bogus
-  `B → B` pending entry, and a real `B → A` reversion arriving after that
-  could no longer cancel anything, since the pending entry it would need
-  to cancel against no longer reflects `A → B`.
-- Only once past the echo check and the no-op check above does the
-  callback feed the transition into bounce-tracking — a
-  `pendingTransition` `Map`, keyed the same way, holding at most one
-  uncommitted `{ from, to, ts, timer }` per key (the same bounce
-  mechanics `core/log.mjs` above describes, owned here instead so it can
-  see every raw transition, per that section) — `ts` is captured here,
-  when the transition is first observed, not left for whichever
-  `log.append` call eventually commits it to assign: on a key with no
-  pending entry, start one holding this transition and the `from`
-  captured above; on a key with a pending `X → Y` entry, either cancel
-  it as a bounce (if the new value equals `X`) or commit it (passing its
-  own captured `ts`, not the current time) and start a fresh pending
-  entry for `Y → newValue` with a newly captured `ts` (if not), as
-  detailed under `core/log.mjs` above. That cancel-or-commit decision —
-  given an existing pending entry and a genuinely new incoming value, is
-  it a bounce or a further change — is a pure function of just those
-  inputs — it needs no timer, no realtime subscription, and no Homey
-  connection to run — so it lives in its own new, side-effect-free
-  module, `core/bounce.mjs`, as `bounceStep(pending, from, to, ts)`,
-  returning `{ commit: { from, to, ts } | null, pending: { from, to, ts
-  } | null }`. It doesn't live in `index.mjs` itself: `index.mjs`'s
-  `main()` connects to Homey and runs unconditionally on module load
-  (phase 1's existing entrypoint pattern, unchanged), so a test
-  importing anything from `index.mjs` directly would trigger a real
-  connection attempt (and phase 1's `exit(69)` on failure) before the
-  test itself ever runs — a separate module with no top-level side
-  effects is what makes `bounceStep` importable from a test in
-  isolation. `bounceStep` is only ever called with a genuinely new
-  incoming value, never to represent "nothing new happened, just flush
-  what's sitting there" — the 2-second timer needs exactly that second
-  operation (below), which isn't a step of the pending/incoming
-  comparison at all, so it isn't expressed as a `bounceStep` call with
-  some placeholder value. **Every** transition that reaches this step
-  (i.e. survived both checks above), including an `alarm_contact`/
-  `alarm_motion` value going back to `false`, is a genuinely new value —
-  bounce-tracking has to see the real sequence of *distinct* values to
-  correctly cancel a `true → false` reversion within the window, which
-  it couldn't do if `false` transitions were filtered out before
-  reaching it.
+  real Recent row.
 
-  Committing a transition — whether `bounceStep`'s `commit` result (an
-  existing pending entry immediately displaced by a further, distinct
-  change), the 2-second timer firing uncontested, or `write()`'s flush
-  (below) — always goes through the same small step, `commitTransition(
-  record)`: apply the `alarm_contact`/`alarm_motion` "going true" filter
-  (design.md wants only `value === true` transitions as Recent rows for
-  these two, not every transition) — if the record's capability is
-  `alarm_contact`/`alarm_motion` and its `to` isn't `true`, it's silently
-  dropped instead of calling `log.append` at all — then, if it passes,
-  `log.append(...)` with the record's own captured `ts`. Applying the
-  going-true filter here, at commit time, not earlier, is what lets a
-  `true → false` within the bounce window actually cancel the pending
-  `true`, since the `false` that would otherwise never have reached
-  bounce-tracking now does. When `bounceStep` returns a non-null
-  `commit`, the `onChange` callback calls `commitTransition(commit)`
-  directly and then stores `bounceStep`'s `pending` result as the key's
-  new `pendingTransition` entry (replacing the one just committed) — the
-  map is being *replaced*, not emptied, so this case doesn't go through
-  `flushPending`. `flushPending(key)`, used by the 2-second timer and by
-  `write()` (below), is the "empty it out" case instead: given a key
-  with a pending entry, it removes that entry and clears its timer, then
-  calls `commitTransition` on the record it held; given a key with no
-  pending entry, it's a no-op. The 2-second timer's callback for a key
-  is exactly `() => flushPending(key)` — not a `bounceStep` call with no
-  real new value to pass it. `log.append`
-  itself still applies the `from === to` no-op dedupe, but only against
-  the `from`/`to` already sitting on the entry it's handed — it never
-  reads `currentValue` itself, since `log.mjs` is a plain buffer with no
-  reference to that cache (see `core/log.mjs` above). What makes that
-  comparison meaningful for the very first event on a freshly subscribed
-  key is this handler capturing `from` *before* updating the cache: the
-  first real event for a key reports the same value `currentValue` was
-  already seeded with at startup, so `from === to` there and the no-op
-  dedupe correctly drops it instead of logging the startup snapshot as a
-  "change".
+  Design.md's only stated time-window behavior for Recent is a fold —
+  "changes within 2s of a mood/flow fold under it" — grouping several
+  *devices* a single mood/flow activation touched into one row, not
+  delaying or cancelling a single key's *own* transitions against each
+  other. Phase 2 has no mood/flow attribution at all (see "Deferred past
+  this phase"), so there's nothing to fold yet, and folding is out of
+  scope here regardless: it groups multiple differently-keyed changes
+  under one shared cause, a different operation entirely from anything a
+  single capability's own callback could decide by itself. A person
+  physically flipping a switch off and back on within two seconds is a
+  real interaction with its own Recent-worthy `A → B` and `B → A` rows,
+  not noise to hide — nothing in design.md calls for suppressing or
+  delaying a single key's own reversal, so this callback doesn't buffer,
+  delay, or cancel anything: it calls `log.append({ id: log.nextId(),
+  kind:
+  "capability", deviceId, capabilityId, deviceName: device.name, from,
+  to: value, cause: null })` directly for every externally-caused
+  transition that reaches this point — no pending map, no timer — except
+  one: if the capability is `alarm_contact`/`alarm_motion` and `value`
+  isn't `true`, the call is skipped entirely, per design.md's "contact/
+  motion going true" wording for what counts as Discrete at all — a
+  `true → false` transition for these two was never meant to be its own
+  Recent row in the first place, independent of any window or reversal.
+  `log.append`'s own `from === to` no-op dedupe (above) still drops a
+  duplicate callback reporting the same value again, or the very first
+  event on a freshly subscribed key reporting the value `currentValue`
+  was already seeded with at startup — no separate no-op check is needed
+  here, since `append` already guards against exactly that.
 
 The serialized write function — what `rpc.mjs` passes to `grammar.run`
 as `setCapabilityValue` (see `core/grammar.mjs` above) — is defined here
@@ -970,43 +929,33 @@ seed one from `device.capabilitiesObj[capabilityId].value` (the value
 already sitting on the resolved device object `write()` was called
 with) before reading anything, rather than reading `from` as `undefined`
 for a device this cache was never told about. Then: reads `from` from
-`currentValue`, calls `flushPending(key)` (above) to resolve whatever
-bounce-buffer entry might already be pending for this key, pushes a
-fresh `{ value: homeyValue, remaining: 2, timer }` record onto
-`pendingSelfWrites`' queue for that key (per the queue design above —
-pushed, never overwriting an existing record), and `await`s `homey.
-setCapabilityValue(device, capabilityId, homeyValue)`. Flushing the
-bounce buffer here, before the write's own change ever reaches
-`onChange`, is what a prompt-caused write needs that an ordinary
-external transition doesn't: `run()` appends a prompt write's `{from,
-to}` directly (below), never through `bounceStep`, so a pending external
-transition left buffered under the old value would otherwise still be
-sitting there — stale — the next time a *real* external event for this
-key reaches `bounceStep`, which would then compute its cancel-or-commit
-decision against a `pending.to` that's no longer where the device
-actually was, producing a nonsense committed transition (e.g. recording
-`B → D` for a real `C → D` change, because the stale entry still said
-`to: B`). Flushing on every prompt write is what keeps `pendingTransition`
-never further behind than the write that most recently changed the key.
+`currentValue`, pushes a fresh `{ value: homeyValue, remaining: 2, timer
+}` record onto `pendingSelfWrites`' queue for that key (per the queue
+design above — pushed, never overwriting an existing record), `await`s
+`homey.setCapabilityValue(device, capabilityId, homeyValue)`, and on
+success sets `currentValue.set(key, homeyValue)` unconditionally.
 
-On success, decides whether to update `currentValue`: a `cacheVersion`
-`Map`, keyed the same way, is incremented every time either `onChange`'s
-real-transition path (above) or this success path itself sets
-`currentValue` for a key. `write()` captures `versionAtStart =
-cacheVersion.get(key) ?? 0` right before the `await` above, and after it
-resolves, only calls `currentValue.set(key, homeyValue)` (bumping
-`cacheVersion`) if the version is still exactly `versionAtStart` —
-unchanged since the write started. If it isn't, a real external
-transition landed on this key while the write was in flight (`onChange`
-is single-threaded JavaScript, so this can only be an interleaving
-across the `await`, never a true data race) and already moved
-`currentValue` to whatever Homey actually holds now; unconditionally
-overwriting it with `homeyValue` at that point would stomp a newer,
-correct value back to a stale one and poison the *next* write's `from`.
-The returned `change` record is unaffected either way — `to: homeyValue`
-is still an honest statement of what this write set the device to at the
-moment it ran, whether or not something else changed it again
-immediately after. `write()` returns `{ deviceId: device.id, deviceName:
+This unconditional overwrite has one accepted, documented edge case,
+the same kind of best-effort limitation as `pendingSelfWrites`' matching
+above: if a genuine external transition lands on this exact key during
+the `await` (a real, rare interleaving — Homey's realtime callback and
+this continuation both run on the same single-threaded event loop, so
+it's a narrow ordering window, never a true concurrent write), that
+external value is visible in `currentValue` only until this write's own
+continuation runs, at which point it's overwritten with `homeyValue`.
+Guarding against it would need to distinguish "the external event
+happened before Homey actually applied this write" (this write's value
+is genuinely the latest, and should win) from "the external event
+happened after" (the external value is latest, and shouldn't be
+overwritten) — a distinction this API surface has no way to make, since
+`onChange` is only ever given a bare `value`, never a timestamp or
+sequence number to order the two against (per the `transactionId`/
+`transactionTime` finding in the Context section above). Either
+resolution is wrong in the other's scenario, and the cache
+self-corrects on the very next real event for this key either way, so
+this plan picks the simpler of the two rather than adding bookkeeping
+that trades one narrow failure mode for an equally narrow one.
+`write()` returns `{ deviceId: device.id, deviceName:
 device.name, capabilityId, from, to: homeyValue }` — `deviceName` comes
 from the `device` object `write()` was called with, captured here rather
 than by `rpc.mjs` reading `devices[change.deviceId].name` after the
@@ -1113,7 +1062,23 @@ being dropped from Recent's scope entirely (design.md itself lists
 ### `core/rpc.mjs` (no structural change)
 Untouched — phase 1 already factored dispatch as a plain `{method:
 handler}` table passed in from `index.mjs`; phase 2 just grows that table
-in `index.mjs`:
+in `index.mjs`. This means no `state.changed` push (design.md's protocol
+section) goes out over the socket this phase, even though the realtime
+subscription and notification poll below genuinely change server-side
+state in between requests — phase 1's `rpc.mjs` only ever dispatches an
+incoming request and returns its response; it has no connected-socket
+registry or broadcast path to push anything unsolicited to a client, and
+phase 2 doesn't add one. This isn't an oversight: `state.changed` exists
+for a wrapper that stays connected and needs to know when to re-fetch
+without polling, and phase 2's only client, `bin/uchi`, is a one-shot
+process — it sends one request, gets one response, and exits, so it has
+no connection open to ever receive a push on. Phase 3 ("Omarchy panel,"
+per design.md's build order) is the first wrapper that's actually
+long-lived, and adding the broadcast path belongs there, against a real
+consumer, not here as speculative plumbing with nothing to call it.
+Every method below still works correctly without it: `bin/uchi` always
+calls `state.get` fresh for each invocation, so it never depends on
+being *told* something changed — it just asks.
 
 - `state.get` refetches `devices`/`zones`/`moods`/`users` and publishes
   them into the shared variables the rest of the `methods` table closures
@@ -1124,12 +1089,29 @@ in `index.mjs`:
   *slower* of the two would otherwise publish its (now stale) snapshot
   *after* the faster one already published a newer one, leaving every
   later Here/grammar/write call reading data older than what a client
-  already saw. `state.get`'s handler guards against this with a single
-  module-level generation counter: increment it and capture the new
-  value before starting the four fetches, then after they resolve, only
-  publish to the shared variables `if` the captured generation still
-  equals the current one — i.e., no newer `state.get` call has started
-  in the meantime. A superseded response still returns its own freshly
+  already saw. `state.get`'s handler guards against this with two
+  module-level counters, not one: `startedGeneration` increments every
+  time a call begins, and each call captures its own value from that
+  before starting its four fetches; `publishedGeneration` tracks the
+  highest generation that has actually *published* successfully, not
+  merely started. After a call's fetches resolve, it publishes to the
+  shared variables only `if` its own captured generation is strictly
+  greater than the current `publishedGeneration`, and then sets
+  `publishedGeneration` to its own generation. Comparing against the
+  last *published* generation, not the last *started* one, is what
+  keeps a failed newer call from permanently blocking an older one's
+  good data: if a newer call's fetches reject, it never reaches the
+  publish step at all and never touches `publishedGeneration`, so an
+  older, still-in-flight call that later succeeds finds its own
+  generation still greater than whatever was last actually published
+  and publishes normally — comparing against "started" instead would
+  have left the shared maps stuck on a stale snapshot indefinitely,
+  since the newer call that "won" the comparison never published
+  anything to begin with. The original race this guard exists for is
+  still covered: if a *faster* newer call publishes before a *slower*
+  older one resolves, the older one's generation is no longer greater
+  than the newer one's already-published generation, so it's correctly
+  suppressed. A superseded response still returns its own freshly
   fetched data to *its own* caller (nothing wrong with what it fetched,
   only with letting it overwrite something newer), it just doesn't
   publish that snapshot for everyone else to read afterward.
@@ -1266,7 +1248,9 @@ Do Not Disturb switch), Bedroom (Bedside Lamp, window contact, thermostat),
 Hallway (motion sensor, Front Door lock), Bathroom (no devices). Moods:
 Movie Night, Morning, Bedtime. Shaped exactly as `devices`/`zones`/`moods`
 maps matching the real shapes verified above (`capabilities`/
-`capabilitiesObj` per device, `zone` per device and mood), plus a small
+`capabilitiesObj` per device, `zone` per device and mood, `min`/`max` on
+every numeric capability — required for the range-check test above to
+mean anything, not just `value`/`type`/`getable`/`setable`), plus a small
 `notifications` array shaped like real `getNotifications()` entries (one
 `ownerName: "Anwesenheit"` presence entry, one `ownerName: "Flow"` entry)
 for `recent.mjs`'s notification-row tests, and a small `users` array
@@ -1278,7 +1262,7 @@ network and no real Homey — this is what makes those modules unit-testable
 the same way phase 1 made `rpc.mjs` unit-testable against a plain dispatch
 table.
 
-### `core/test/grammar.test.mjs`, `core/test/recent.test.mjs`, `core/test/here.test.mjs`, `core/test/bounce.test.mjs` (new)
+### `core/test/grammar.test.mjs`, `core/test/recent.test.mjs`, `core/test/here.test.mjs` (new)
 Against `fixture.mjs`, `node --test`:
 - Grammar: `"desk 40"` resolves to `{ matches: [], action: { deviceId:
   <Desk Lamp's id>, capabilityId: "dim", value: 0.4 } }` (design.md's own
@@ -1309,27 +1293,12 @@ Against `fixture.mjs`, `node --test`:
   as `{label: ownerName, why: excerpt}` with no `line`; appending the
   same notification `id` twice (simulating a re-poll) doesn't duplicate
   the row; `seedNotificationIds` followed by `appendNotification` for
-  one of those same ids appends nothing. (The self-write-echo registry
-  and the serialized `write()` function live in `core/index.mjs`, not
-  `log.mjs`/`recent.mjs`, and need a real realtime connection to echo
-  anything back — exercised by the live verification steps below, not a
-  fixture unit test. Bounce-tracking's decision logic lives in
-  `core/bounce.mjs` instead, precisely so it doesn't share that
-  limitation — see `bounce.test.mjs` below.)
-- Bounce: `bounceStep(pending, from, to, ts)` (the pure bounce-decision
-  helper `core/bounce.mjs` exports, above), imported directly from that
-  module — not from `core/index.mjs`, which would run `main()` on import
-  — no timers or fixture devices needed — an `A → B` call with no
-  pending entry returns `{
-  commit: null, pending: { from: A, to: B, ts } }`; a second call for the
-  same key with that pending entry and `to === A` (the bounce) returns
-  `{ commit: null, pending: null }` — cancelled, nothing to show; a
-  second call with a *third*, distinct value `C` returns `{ commit: {
-  from: A, to: B, ts: <the first call's ts> }, pending: { from: B, to: C,
-  ts: <the second call's ts> } }` — the prior transition commits with its
-  own original `ts`, not the second call's, and a fresh pending entry
-  starts for `B → C`, so a genuine `A → B → C` sequence with no
-  reversion is never lost or reordered.
+  one of those same ids appends nothing. (The self-write-echo registry,
+  the serialized `write()` function, and the `alarm_contact`/
+  `alarm_motion` going-true filter all live in `core/index.mjs`'s
+  `onChange` handler, not `log.mjs`/`recent.mjs`, and need a real
+  realtime connection to exercise meaningfully — covered by the live
+  verification steps below, not a fixture unit test.)
 - Here: `compute(null, ...)` returns `null`; `compute(<an unknown zone
   id>, ...)` also returns `null` (the stale-context guard); `compute(
   <Kitchen's zone id>, ...)` returns Kitchen's 5 lights and no moods
@@ -1339,8 +1308,8 @@ Against `fixture.mjs`, `node --test`:
 
 ## Verification (run these, in order)
 
-1. `cd core && node --test` — all of phase 1's existing test plus the four
-   new suites above (grammar, recent, here, bounce), against the fixture,
+1. `cd core && node --test` — all of phase 1's existing test plus the
+   three new suites above (grammar, recent, here), against the fixture,
    no real Homey needed.
 2. `bin/uchi status` against the real core (already running per phase 1's
    verification) — must print the aggregate summary line; with no
@@ -1374,6 +1343,12 @@ Against `fixture.mjs`, `node --test`:
 
 ## Deferred past this phase
 
+- **The `state.changed` push and a connected-socket broadcast path** —
+  `core/rpc.mjs` stays a plain request/response dispatcher this phase
+  (see `core/rpc.mjs` above); phase 2's only client, `bin/uchi`, is
+  one-shot and never has a connection open to push to. Belongs in phase
+  3, the first long-lived wrapper (Omarchy panel), against a real
+  consumer that actually needs to know when to re-fetch without polling.
 - **Cause attribution for externally-triggered *capability* changes**
   specifically (`cause: null` for anything not our own `prompt.run`) —
   this is narrower than "no attribution at all": presence and Homey
