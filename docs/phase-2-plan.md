@@ -490,11 +490,16 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   controls the wording of. `"(you)"` in `why` and `in` as a field serve
   two different consumers — a human reading the row, and code that wants
   to filter the list — and now both exist rather than only the one.
-  A `kind: "notification"` row (next) carries no `in` field at all: a
-  notification is never `prompt`-caused (this process only observes
-  them, never creates one), so it's unambiguously "out" by `kind` alone,
-  and an absent field on that row kind is itself the signal, not a gap
-  to fill with a hardcoded `false`.
+  A `kind: "notification"` row (next) carries `in: false` too, not an
+  absent field: a notification is never `prompt`-caused (this process
+  only observes them, never creates one), so it's unambiguously "out" —
+  but a caller filtering the mixed Recent list with `row.in === false`
+  would otherwise silently miss every notification row, since `undefined
+  !== false`, forcing a kind-specific special case onto what's supposed
+  to be one uniform field across every row Recent returns. `in` is
+  present with a real boolean on both row kinds for exactly this reason
+  — one consistent contract, not two different implicit rules for two
+  row kinds sharing the same list.
 
   `line` is the grammar line that undoes the change, but only for a
   `capabilityId` phase 2's own grammar can actually execute — `onoff`
@@ -560,15 +565,17 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   since took that name (a real but narrow edge case phase 2 doesn't add
   machinery for beyond what `resolve()` already does).
 - A `kind: "notification"` row: `{ id, kind, label, why }` — `label` is
-  the entry's real `ownerName` (`"Anwesenheit"`, `"Flow"`, `"Apps"`),
-  `why` is its `excerpt` verbatim. No `line`: a notification isn't a
-  device state to revert, it's a fact that happened, matching design.md's
-  own doorbell example ("a doorbell is simply the newest change...
-  carrying `haustür unlock` instead" — an *event-table* line, which is
-  `events` in `readCoreConfig()`, not something derived from the
-  notification text itself; phase 2 doesn't implement the event-table
-  lookup, so a notification row is line-less until whichever phase wires
-  `events` up).
+  the entry's real `ownerName` (its owning app/flow/feature name, per the
+  Context section above), `why` is its `excerpt` verbatim. No `line`: a
+  notification isn't a device state to revert, it's a fact that
+  happened. Design.md's core config names an `events` field for exactly
+  this kind of row — "name → `{line, ttl}` for doorbell/etc." — mapping
+  a notification's own name to a proposed action line (e.g. a doorbell
+  notification proposing the front door's unlock line), but phase 2 only
+  *reads* `events` from `readCoreConfig()` (above) without wiring it
+  into a notification row's `line`, so a notification row stays
+  line-less this phase regardless of what `events` contains, until
+  whichever phase actually does that lookup.
 
 ### `core/grammar.mjs` (new)
 Exactly what design.md's repo layout names it: an exact/fuzzy/thing-number
