@@ -11,7 +11,15 @@ Phase 2, per `docs/design.md`'s build order, is: **"`state.get` returns real
 hero/Here data, verbs, log with causes, Recent (log-derived, in/out filter,
 undo lines), grammar (exact/fuzzy/thing-number). `bin/uchi` gains real
 commands. Tests against a recorded house fixture. Done: `uchi desk 40` works
-from a terminal, `uchi status` prints the hero line."** That parenthetical —
+from a terminal, `uchi status` prints the hero line."** "Real hero ... data"
+here means real presence and total draw, not literally all three of
+design.md's named `hero.summary` components — active-mood count is
+explicitly out of scope this phase (see `rpc.mjs`'s `state.get` below and
+"Deferred past this phase"), since the verified mood shape has no `active`
+flag to read one from. Phase 2's own literal done-criterion is `uchi
+status` printing the hero line, not every named component being present
+in it, so this is a scope decision within that criterion, not a shortfall
+against it. That parenthetical —
 `(exact/fuzzy/thing-number)` — is also the literal name given to
 `grammar.mjs` in design.md's target repo layout, and it scopes phase 2's
 grammar precisely: resolve a thing (device or zone name, exact then fuzzy)
@@ -320,12 +328,22 @@ Revisit this file when phase 5 actually needs persistence.
   deviceId, deviceName, capabilityId, from, to, cause }`. `append` always
   assigns `ts: Date.now()` itself — every capability entry is appended
   the moment `core/index.mjs` decides it's worth keeping, whether that's
-  a real transition observed via `subscribeToDiscreteChanges` or a
-  `prompt.run`-caused write (see `rpc.mjs` below), so append time and
-  event time are the same instant in both cases; there's no delayed or
-  buffered path that would need a caller-supplied `ts` to stay accurate.
-  `id` is a process-local counter `log.mjs` mints and assigns here — a
-  capability
+  a real transition observed via `subscribeToDiscreteChanges` (`ts` is
+  the instant the realtime callback fires, as close to the actual event
+  as this process ever observes it) or a `prompt.run`-caused write (see
+  `rpc.mjs` below), where `ts` is stamped once `write()`'s own `await`
+  resolves — the moment *this process* learns the write succeeded, not
+  necessarily the exact moment Homey applied it, since a slow write's
+  completion can lag its real effect by however long that call took.
+  There's no delayed or buffered path *within* `log.mjs`/`index.mjs`
+  itself that would need a caller-supplied `ts` to correct for, but a
+  genuinely slow prompt write is still an accepted, narrow best-effort
+  limitation for Recent's ordering: nothing
+  in this API surface tells this process exactly when Homey applied a
+  write it made, only when the confirmation came back, so a slow write's
+  row can appear after a fast external event that actually happened
+  later in real time. `id` is a process-local counter `log.mjs` mints
+  and assigns here — a capability
   entry has no natural id of its own (a device/capability/timestamp
   triple isn't guaranteed unique against rapid repeated writes) — while
   a notification entry (below) keeps Homey's own real `id` unchanged
@@ -382,10 +400,18 @@ Revisit this file when phase 5 actually needs persistence.
   persistent notification, not a live-only event), and the ring no
   longer remembers having seen it — so the same notification would get
   re-appended, and re-shown as a "new" Recent row, forever. `log.mjs`
-  therefore also keeps a separate, *unbounded-within-the-process* `Set`
-  of every notification `id` it has ever appended, checked instead of
-  scanning the ring, so eviction from the display buffer never causes a
-  re-append.
+  therefore also keeps a separate `Set` of every notification `id` it
+  has appended, checked instead of scanning the ring, so eviction from
+  the display buffer never causes a re-append — but capped at 2000
+  entries, not left to grow for the process's entire lifetime: a plain
+  `Set` preserves insertion order, so once adding an id would exceed the
+  cap, the oldest-inserted id is deleted first. This house's real
+  notification history is 250 entries total going back weeks (see
+  Context above); 2000 is generous headroom against that real volume,
+  bounding this `Set`'s memory to a fixed size instead of growing
+  without limit across however long a single core process stays up,
+  while still comfortably covering realistic notification rates between
+  restarts.
 - `seedNotificationIds(ids)` — adds every id in `ids` to that same seen
   set *without* appending anything. This is the explicit, named
   operation `core/index.mjs`'s first notification poll needs (below): it
@@ -442,12 +468,29 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   stores Homey's real normalized `0–1` value (see `core/homey.mjs`
   above), and
   "dimmed to 0.4" would be wrong to show a user who thinks in percent —
-  plus `"(you)"` appended when `cause` is `"prompt"` (design.md's "in/out
-  filter" — the closest honest rendering of in/out attribution phase 2's
-  data actually supports for this row kind; the row exposes this as text
-  in `why`, not as a separate `cause` field, so a caller checks for the
-  `"(you)"` substring, not a schema field, when it needs to tell the two
-  apart).
+  plus `"(you)"` appended when `cause` is `"prompt"`. Design.md names
+  "in/out filter" as one of phase 2's own literal deliverables (its
+  build-order line, quoted in Context above) but never defines what
+  mechanism that phrase means beyond naming it — no separate protocol
+  field, RPC parameter, or toggle appears anywhere else in design.md.
+  Phase 2's reading of it is attribution as **text**, not a queryable
+  **filter**: `why` carries `"(you)"` (or doesn't) so a human reading a
+  row can tell in from out at a glance, the same way `"(you)"` reads in
+  design.md's own Recent examples, but there's no `recent.list()`
+  parameter, RPC parameter, or structured field a caller could use to
+  actually *filter* — only render — by in/out; a caller that wants to
+  hide one or the other has to parse the `"(you)"` substring itself,
+  not ask the core to do it. This is the same distinction the
+  cause-attribution limitation above already draws between "descriptive
+  flavor" and "something downstream depends on structurally": a
+  structured filter parameter is exactly the kind of interactive-UI
+  affordance phase 3's actual panel (not `bin/uchi`, phase 2's only
+  client, which has no toggle to wire one to) would be the first real
+  consumer for, so adding one now would be speculative surface area
+  with nothing calling it yet — narrower than "in/out filter" might
+  suggest, but not a shortfall against phase 2's own literal
+  done-criteria, which name neither a filter parameter nor a specific
+  Recent interaction.
 
   `line` is the grammar line that undoes the change, but only for a
   `capabilityId` phase 2's own grammar can actually execute — `onoff`
@@ -485,7 +528,18 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   the complement of `grammar.mjs`'s own recognized verbs/targets below,
   so extending grammar's coverage automatically extends which
   capabilities get a real undo line, with no separate list to keep in
-  sync by hand.
+  sync by hand. These four still need a `why` — the row contract
+  requires it whether or not `line` is present — so `recent.mjs` renders
+  it directly for these, not through `grammar.mjs`'s
+  `formatCapabilityWhy()` (which only covers the five capabilities a
+  `line` can target, above): `speaker_playing`'s boolean `to` renders as
+  `"playing"`/`"stopped"`; `alarm_contact`/`alarm_motion` rows are always
+  `to: true` (the going-true filter drops every other transition before
+  it reaches `log.append`, per `core/index.mjs` below) and render as the
+  fixed strings `"open"`/`"motion"` respectively — Homey's own
+  convention for what `true` means on each; `windowcoverings_state` is
+  Homey's own enum string (`"up"`/`"down"`/`"idle"`), already
+  human-readable, and renders as `to` verbatim with no conversion.
 
   A `line` built from `deviceName` text is only as executable as
   `grammar.mjs`'s own exact-match step (above) makes it: if the house
@@ -707,8 +761,14 @@ avoids `compute()` crashing every subsequent `state.get` on a stale
 context value it never asked to be told about again. `moods` filters the
 mood map by `mood.zone === zoneId`. `devices` filters to `device.zone
 === zoneId` **and** at least one `setable` capability among
-`onoff`/`dim`/`locked`/`target_temperature`/`volume_set` — design.md's
-Here section says "controllable devices," not every device in the zone,
+`onoff`/`dim`/`locked`/`target_temperature`/`volume_set`/
+`speaker_playing` — `speaker_playing` is included in this filter even
+though phase 2's grammar has no play/pause verb for it (recent.mjs
+above renders a `why` for it with no `line`, for the same reason): a
+speaker whose only setable capability happened to be `speaker_playing`
+would otherwise be silently excluded from Here entirely, when
+design.md's Here section says "controllable devices," not every device
+in the zone,
 and the fixture makes the distinction concrete: Kitchen has 5 lights plus
 a Kitchen Switch (a physical remote, design.md's own description of it),
 and a remote has no setable capability of its own to control — it
@@ -719,17 +779,33 @@ not 6.
 Each surviving device is rendered as `{ id, label, why, line }` matching
 the row contract every section uses. A device can have more than one of
 the five controllable capabilities at once — an ordinary light has both
-`onoff` and `dim` — so picking one needs two passes, not one flat
-priority order over all five: first, `numericTargets` — the device's
-present-*and*-`setable` capabilities among `dim`/`target_temperature`/
-`volume_set` — is computed exactly the way `grammar.mjs`'s bare-number
-step (above) does, because that's the whole point: `grammar.mjs` only
-accepts a bare number when a device has **exactly one** of these three,
-so a `line` built from a different assumption could name a capability
-that same input would actually reject as `"needs a word"`. If
-`numericTargets.length === 1`, that capability is the pick for both
-`why` and `line` — the ordinary case, and the only one where a numeric
-`line` is safe to offer at all. Otherwise (zero or more than one
+`onoff` and `dim` — so picking one needs several passes, not one flat
+priority order over all five. First, and before anything else: if the
+device has `onoff` present and `setable` **and** its current value is
+`false`, `onoff` is the pick, full stop — `why: "off"`, `line: "<device
+name> off"` — regardless of what `dim` (or any other capability) reads.
+This is the same rule `hero.summary`'s active-device count already
+applies (above): a light switched off but still holding a nonzero `dim`
+level from before — the normal state after an `onoff`-only "off"
+command, since turning a light off doesn't reset its remembered
+brightness — is off, full stop, not "dimmed to 40%." Showing the
+remembered `dim` level here instead would misdescribe a device that
+isn't emitting any light as if it were on at that brightness, and its
+`line` would turn the light *on* (Homey's own real behavior for a
+nonzero `dim` write) rather than reflect the device's actual current
+state — the opposite of what a Here row re-applying its own current
+value is supposed to do. Only once that check has passed — `onoff`
+absent, not `setable`, or currently `true` — do the remaining two passes
+run: `numericTargets` — the device's present-*and*-`setable`
+capabilities among `dim`/`target_temperature`/`volume_set` — is computed
+exactly the way `grammar.mjs`'s bare-number step (above) does, because
+that's the whole point: `grammar.mjs` only accepts a bare number when a
+device has **exactly one** of these three, so a `line` built from a
+different assumption could name a capability that same input would
+actually reject as `"needs a word"`. If `numericTargets.length === 1`,
+that capability is the pick for both `why` and `line` — the ordinary
+case, and the only one where a numeric `line` is safe to offer at all.
+Otherwise (zero or more than one
 numeric target — a device with, say, both `dim` and
 `target_temperature` setable would otherwise let this row's `dim` pick
 generate `"<device> 40"`, which `grammar.mjs` would reject as ambiguous
@@ -741,27 +817,32 @@ numbers do: typing `"on"` only ever names `onoff` and `"lock"` only ever
 names `locked`, so a device having both `onoff` and `locked` setable
 creates no comparable conflict — each verb's own word already picks its
 capability, independent of the other. If neither `onoff` nor `locked`
-is present and setable either (a device whose only controllable
-capabilities are two or more ambiguous numeric targets — the zone-level
-`setable` filter above guarantees *some* capability among the five, not
-that it resolves to an executable line), `why` still uses `
-numericTargets[0]`'s current value, so the row isn't blank, but `line`
-is omitted — the same "no `line` for a capability `grammar.mjs` can't
-write this way" rule `recent.mjs` already applies for its own undo
-lines (below), applied here for the same underlying reason: an
-ambiguous numeric target and a capability grammar.mjs doesn't recognize
-at all are both cases where no line phase 2's own grammar could ever
-run, not merely a capability grammar.mjs hasn't gotten to yet. `why` is
-the picked capability's current value, formatted via one shared
-`grammar.mjs` function, `formatCapabilityWhy(capabilityId, value)` —
-`toDisplayPercent()`-converted for `dim`/`volume_set` (e.g. `"40%"`),
-plain for `target_temperature` (e.g. `"21°"`), and `"on"`/`"off"`/
+is present and setable either, the next fallback is `speaker_playing`
+(present and `setable`) — `why` only, per `recent.mjs`'s own rendering
+for it above (`"playing"`/`"stopped"`), never `line`, since phase 2's
+grammar has no play/pause verb to execute regardless of which single
+device it targets. Only if none of `onoff`/`locked`/`speaker_playing`
+is present and setable either — a device whose only controllable
+capabilities are two or more ambiguous numeric targets, the one
+remaining case the zone-level filter's six capabilities can still
+produce — does `why` fall back to `numericTargets[0]`'s current value,
+so the row isn't blank, with `line` omitted — the same "no `line` for a
+capability `grammar.mjs` can't write this way" rule `recent.mjs` already
+applies for its own undo lines (above), applied here for the same
+underlying reason: an ambiguous numeric target and a capability
+grammar.mjs doesn't recognize at all are both cases where no line phase
+2's own grammar could ever run, not merely a capability grammar.mjs
+hasn't gotten to yet. `why` is the picked capability's current value —
+`formatCapabilityWhy(capabilityId, value)`, the one shared `grammar.mjs`
+function, for the five it covers (`toDisplayPercent()`-converted for
+`dim`/`volume_set`, plain for `target_temperature`, `"on"`/`"off"`/
 `"locked"`/`"unlocked"` for the boolean pair — that `rpc.mjs`'s
-`prompt.resolve` handler also calls (above), rather than each
-duplicating the same five-capability formatting; `line`, when present,
-is the same `toLinePercent()`-based undo-style line `recent.mjs` builds
-for a re-apply of the picked capability, reusing that formatting logic
-— factor the shared from-value → line renderer into `grammar.mjs` so
+`prompt.resolve` handler also calls, above, rather than duplicating the
+same formatting), or `recent.mjs`'s own `speaker_playing` rendering
+(above) when that's the pick instead; `line`, when present, is the same
+`toLinePercent()`-based undo-style line `recent.mjs` builds for a
+re-apply of the picked capability, reusing that formatting logic —
+factor the shared from-value → line renderer into `grammar.mjs` so
 `here.mjs` and `recent.mjs` don't duplicate it.
 
 ### `core/index.mjs` (extend)
@@ -887,10 +968,9 @@ needs to be current *between* `state.get` calls:
   real interaction with its own Recent-worthy `A → B` and `B → A` rows,
   not noise to hide — nothing in design.md calls for suppressing or
   delaying a single key's own reversal, so this callback doesn't buffer,
-  delay, or cancel anything: it calls `log.append({ id: log.nextId(),
-  kind:
-  "capability", deviceId, capabilityId, deviceName: device.name, from,
-  to: value, cause: null })` directly for every externally-caused
+  delay, or cancel anything: it calls `log.append({ kind: "capability",
+  deviceId, capabilityId, deviceName: device.name, from, to: value,
+  cause: null })` directly for every externally-caused
   transition that reaches this point — no pending map, no timer — except
   one: if the capability is `alarm_contact`/`alarm_motion` and `value`
   isn't `true`, the call is skipped entirely, per design.md's "contact/
@@ -942,20 +1022,38 @@ the `await` (a real, rare interleaving — Homey's realtime callback and
 this continuation both run on the same single-threaded event loop, so
 it's a narrow ordering window, never a true concurrent write), that
 external value is visible in `currentValue` only until this write's own
-continuation runs, at which point it's overwritten with `homeyValue`.
-Guarding against it would need to distinguish "the external event
-happened before Homey actually applied this write" (this write's value
-is genuinely the latest, and should win) from "the external event
-happened after" (the external value is latest, and shouldn't be
-overwritten) — a distinction this API surface has no way to make, since
-`onChange` is only ever given a bare `value`, never a timestamp or
-sequence number to order the two against (per the `transactionId`/
-`transactionTime` finding in the Context section above). Either
-resolution is wrong in the other's scenario, and the cache
-self-corrects on the very next real event for this key either way, so
-this plan picks the simpler of the two rather than adding bookkeeping
-that trades one narrow failure mode for an equally narrow one.
-`write()` returns `{ deviceId: device.id, deviceName:
+continuation runs, at which point it's overwritten with `homeyValue` —
+even in the narrower case where this write's own two self-echoes (for
+that same `homeyValue`) already arrived *and* a *further* external
+change landed after them, both before this `await` itself resolves; the
+overwrite would then stomp that later external value with this write's
+now-stale one.
+
+A per-key version guard — capture a version before the `await`, only
+publish if nothing bumped it in the meantime — looks like the fix, but
+it trades this failure mode for a worse one rather than removing it:
+a version guard is keyed to "did anything else touch this key," not to
+"is my
+own value still current," so the *first* time anything external touches
+the key during the `await`, the guard permanently blocks this write's
+own completion from ever publishing — including in the far more common
+case where this write's `homeyValue` is genuinely the latest real value
+and the external event that bumped the version was itself the *stale*
+one (superseded by this write). Since nothing else is left responsible
+for ever writing `homeyValue` into the cache once the guard blocks it,
+that case gets stuck on the external value indefinitely, not just until
+the next real event for the key. Resolving this correctly would need
+this API surface to say *when* each value actually took effect on the
+device, not merely *that* it changed — `onChange` is only ever given a
+bare `value`, never the `transactionId`/`transactionTime` the raw
+socket event actually carries (per the Context section above) — so
+there is no ordering information available to make the guard's
+suppress/publish choice correctly in both directions at once. Between a
+narrow window where a fast overwrite can stomp a genuinely newer value,
+and a guard that can just as narrowly get permanently stuck on a stale
+one, this plan takes the option that self-corrects on the very next
+real event for the key rather than the one that doesn't self-correct at
+all. `write()` returns `{ deviceId: device.id, deviceName:
 device.name, capabilityId, from, to: homeyValue }` — `deviceName` comes
 from the `device` object `write()` was called with, captured here rather
 than by `rpc.mjs` reading `devices[change.deviceId].name` after the
@@ -970,6 +1068,30 @@ another same-key write could have pushed a record with the same value in
 the meantime) from the queue, so a failed write doesn't leave a phantom
 echo expectation behind, and rethrows, for `grammar.run` to catch (see
 above).
+
+`state.get`'s fresh `devices` fetch is also `currentValue`'s only
+resync path: whenever a `state.get` call wins the publish-generation
+race (above), it also writes each device's real, freshly-fetched
+`capabilitiesObj[capabilityId].value` into `currentValue` for every
+`DISCRETE_CAPABILITIES` entry that device has — a plain overwrite, the
+same accepted-narrow-race treatment `write()`'s own cache update uses
+(above), not a new guard. Without this, a realtime event dropped during
+a reconnect gap (the WebSocket-style subscription silently missing a
+transition, a real possibility this plan doesn't otherwise defend
+against) would leave `currentValue` stale *indefinitely* — unlike the
+narrow single-write races documented above, which self-correct on the
+very next real event for that key, a dropped event has no "next event"
+to self-correct with until some unrelated later change happens to the
+same key, which could be a long time. Tying reconciliation to
+`state.get` bounds the staleness window to "no worse than since the
+last `state.get` call" instead, without adding a separate poll or
+reconnect-detection mechanism of its own. The same in-flight-write
+interleaving this plan accepts elsewhere applies here too: a
+`state.get` fetch that happens to resolve while a same-key `write()` is
+still awaiting Homey's response can momentarily reconcile `currentValue`
+back to the pre-write value, since the fetched snapshot doesn't yet
+reflect a write Homey hasn't confirmed — self-corrected moments later
+when that `write()`'s own completion applies its `homeyValue`.
 
 `devices`/`zones`/`moods`/`users` plus an in-memory `context` object (`{
 machineRoom: null, idle: null, mic: null, media: null }`, updated only by
@@ -1343,6 +1465,15 @@ Against `fixture.mjs`, `node --test`:
 
 ## Deferred past this phase
 
+- **Active-mood count in `hero.summary`** — design.md names it as the
+  third component of Hero's summary line ("presence, active moods, total
+  draw"), alongside presence and total draw, both of which phase 2 does
+  implement (see `rpc.mjs`'s `state.get` above). The verified mood shape
+  (`{id, name, preset, devices, zone, uri}`) has no `active` flag, and
+  nothing in phase 2 calls `moods.setMood` (mood activation is deferred,
+  next bullet) — tracking "moods activated since core startup" would
+  track an event that can never happen yet. Revisit once mood activation
+  itself is real and there's a genuine "active" signal to summarize.
 - **The `state.changed` push and a connected-socket broadcast path** —
   `core/rpc.mjs` stays a plain request/response dispatcher this phase
   (see `core/rpc.mjs` above); phase 2's only client, `bin/uchi`, is
