@@ -936,7 +936,15 @@ fetch's own `capabilitiesObj` values for every capability in
 `DISCRETE_CAPABILITIES`. This one cache is what fixes three related gaps
 at once, all stemming from the same root cause — relying on the
 `devices` snapshot (refreshed only by `state.get`) for a value that
-needs to be current *between* `state.get` calls:
+needs to be current *between* `state.get` calls. Build `startupDeviceNames`
+alongside it, a plain `Map` from `deviceId` to `name`, seeded from the
+same startup `devices` fetch — `onChange`'s callback (below) is only
+ever given `{ deviceId, capabilityId, value }` by `subscribeToDiscreteChanges`
+(see `core/homey.mjs` above; it never receives a `device` object of its
+own to fall back to), so this small, purpose-built map is what lets it
+recover a name for a device the *live*, `state.get`-refreshed `devices`
+map no longer has, without inventing a `device` binding that was never
+part of the callback's own contract:
 
 - Call `subscribeToDiscreteChanges` **once**, against the device map
   from that startup fetch. Its `onChange` callback **first** captures
@@ -1023,26 +1031,29 @@ needs to be current *between* `state.get` calls:
   delaying a single key's own reversal, so this callback doesn't buffer,
   delay, or cancel anything: it calls `log.append({ kind: "capability",
   deviceId, capabilityId, deviceName: devices[deviceId]?.name ??
-  device.name, from, to: value, cause: null })` directly for every
-  externally-caused
+  startupDeviceNames.get(deviceId), from, to: value, cause: null })`
+  directly for every externally-caused
   transition that reaches this point — no pending map, no timer — except
   one: if the capability is `alarm_contact`/`alarm_motion` and `value`
   isn't `true`, the call is skipped entirely, per design.md's "contact/
   motion going true" wording for what counts as Discrete at all — a
   `true → false` transition for these two was never meant to be its own
   Recent row in the first place, independent of any window or reversal.
-  `deviceName` reads the *live* `devices` map (the module-level variable
-  `state.get` reassigns on every call, above), not the `device` object
-  `subscribeToDiscreteChanges` closed over at startup — that startup
-  object is never replaced once the subscription exists, so a device
-  renamed after startup would otherwise log every future external
-  transition under its old name forever, contradicting `log.append`'s
+  `deviceName` reads the *live* `devices` map first (the module-level
+  variable `state.get` reassigns on every call, above) — not a `device`
+  object, since `onChange` was never handed one (its whole payload is
+  `{ deviceId, capabilityId, value }`, per `subscribeToDiscreteChanges`'s
+  own contract above) — so a device renamed after startup logs future
+  external transitions under its *current* name, matching `log.append`'s
   own "snapshot at append time" contract for `deviceName` (above): the
   snapshot has to actually be taken *at append time*, not at
-  subscription-creation time. The `?? device.name` fallback covers the
-  one case a live lookup can miss — a device removed from a later
-  `state.get`'s fresh map (the topology-change limitation below) — where
-  the startup snapshot is the only name left to fall back on.
+  subscription-creation time. `startupDeviceNames.get(deviceId)` is the
+  fallback for the one case a live lookup can miss — a device removed
+  from a later `state.get`'s fresh map (the topology-change limitation
+  below) — where the startup snapshot, captured once alongside
+  `currentValue` (above), is the only name left to fall back on; it's a
+  small map built for exactly this, not a repurposed `device` reference
+  that was never in scope here.
   `log.append`'s own `from === to` no-op dedupe (above) still drops a
   duplicate callback reporting the same value again, or the very first
   event on a freshly subscribed key reporting the value `currentValue`
