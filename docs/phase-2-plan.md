@@ -209,20 +209,36 @@ Add, using only the operation names verified above:
   below happens in the caller, not here, keeping this wrapper a pure
   pass-through.
 - `PERCENT_CAPABILITIES = new Set(["dim", "volume_set"])` with
-  `toHomeyValue(capabilityId, percent)` (`percent / 100`) and
-  `toPercent(capabilityId, homeyValue)` (`Math.round(homeyValue * 100)`)
-  for the two in that set, identity for everything else. Verified live
-  against this house, not assumed from the `units: "%"` hint alone: every
-  real `dim` and `volume_set` capability read has `min: 0, max: 1` —
-  `units: "%"` is purely a *display* hint, the actual stored/written
-  value is normalized 0–1. `target_temperature` was checked the same way
-  and is genuinely real degrees (`min: 4, max: 35` on this house's real
+  `toHomeyValue(capabilityId, percent)` (`percent / 100`) for the two in
+  that set, identity for everything else. Verified live against this
+  house, not assumed from the `units: "%"` hint alone: every real `dim`
+  and `volume_set` capability read has `min: 0, max: 1` — `units: "%"`
+  is purely a *display* hint, the actual stored/written value is
+  normalized 0–1. `target_temperature` was checked the same way and is
+  genuinely real degrees (`min: 4, max: 35` on this house's real
   thermostats) — it is **not** in `PERCENT_CAPABILITIES` and needs no
   conversion, matching design.md's own `"arb temp 21"` example taking a
   literal degree value. Getting this wrong is exactly how `uchi desk 40`
   — phase 2's own literal done-criterion — would fail or clamp to full
   brightness instead of dimming to 40%: without this conversion, `40` is
   sent directly where Homey expects `0.4`.
+
+  `toPercent()` comes in two variants, not one, because rounding is
+  appropriate for one caller and actively wrong for the other:
+  `toDisplayPercent(capabilityId, homeyValue)` (`Math.round(homeyValue *
+  100)`) is for `why` text a human reads (`"dimmed to 40%"`) — whole
+  percent is the right amount of precision there. `toLinePercent(
+  capabilityId, homeyValue)` (`Math.round(homeyValue * 1000) / 10`, one
+  decimal place) is for a `line` meant to be re-executed as an undo:
+  rounding a real value like `0.405` to the nearest whole percent gives
+  `41`, and running `<device> 41` writes back `0.41`, not the original
+  `0.405` — a real precision loss for something specifically promising
+  to *undo* a change. One decimal place doesn't make the round-trip
+  perfectly exact either (percent-of-a-0–1-range is lossy in general),
+  but it's a real, deliberate improvement over whole-percent for exactly
+  the one use case (`line`) where the loss is user-visible as "the undo
+  didn't fully undo," not just a rounding hair `why`'s prose never
+  exposes.
 - `getNotifications(api)` → `api.notifications.getNotifications()`. Real,
   verified operation (`ManagerNotifications.getNotifications` in the spec)
   returning entries shaped `{id, ownerUri, ownerName, excerpt, dateCreated,
@@ -274,50 +290,21 @@ Revisit this file when phase 5 actually needs persistence.
   `from === to` — a write that lands on the value it already had is not
   a transition, and this guard is what actually makes a redundant prompt
   write (e.g. dimming a light already at 40% to 40%) produce no Recent
-  row, not a side effect of the bounce handling below.
+  row.
 
-  (The self-write echo — confirmed live: `setCapabilityValue` triggers
-  the subscribed realtime listener **twice** with the same value, not
-  once — is *not* handled here. It's detected in `core/index.mjs`,
-  before `log.append` is ever called for that event, against a registry
-  of writes-in-flight rather than against the log's own tail; see
-  `core/index.mjs` below for why matching against "the log's most recent
-  entry" specifically doesn't work.)
-
-  One further kind of realtime noise *is* filtered here, inside
-  `append` itself, confirmed against a real house: **the bounce**. Per
-  the Uchi artifact's Recent "Out" list explicitly ("a value changing
-  back within two seconds, which is a bounce, not a change") — a
-  capability going `A → B → A` within 2 seconds is a flicker, not two
-  real changes. Held in a short-lived pending slot (keyed by
-  `deviceId`+`capabilityId`, separate from the log itself, holding at
-  most one *uncommitted* transition per pair) rather than appended
-  immediately, with a 2-second timer per pending slot that commits it if
-  nothing else arrives first. On each incoming transition `P → Q` for a
-  key with no pending slot: start one holding `P → Q` and its timer. For
-  a key that already has a pending `X → Y` slot: if `Q === X` (the value
-  is reverting to what the pending transition started from), it's a
-  bounce — cancel the timer, discard the pending slot, append nothing
-  for either half. Otherwise (`Q !== X` — a *further*, distinct change,
-  not a reversion of the pending one) the pending `X → Y` is no longer
-  in question — commit it to the log immediately, cancel its timer, and
-  start a new pending slot holding `Y → Q` with its own fresh timer. This
-  is what correctly handles three changes in quick succession
-  (`A → B → C`, neither step a reversion of the other): `A → B` commits
-  the moment `C` arrives (since `C ≠ A`), and `B → C` becomes the new
-  pending slot, rather than the naive one-slot version silently
-  overwriting `A → B` and never appending it, or applying the bounce
-  window to a transition that was never actually reverted. Bounce
-  detection only ever compares an incoming value against the single most
-  recent *pending* transition's origin — it does not scan further back
-  through already-committed history, matching the artifact's own
-  two-value framing ("a value changing back") rather than a general
-  cycle detector. This costs Recent up to a 2-second display delay for
-  the *last* transition in any such run, which is the honest trade for
-  never appending-then-un-appending — an append-only log can't implement
-  "remove an already-appended entry" (that's a mutation), so the only way
-  to keep both the bounce rule and the append-only contract is to decide
-  each transition's fate *before* appending it, not after.
+  `log.mjs` itself is otherwise a plain buffer: neither the self-write
+  echo nor the bounce is decided here. Both are realtime-event policy —
+  deciding whether a given raw transition is noise at all, before it
+  ever becomes a candidate `append` call — and both live in
+  `core/index.mjs`'s `onChange` handler (below), which is the one place
+  that sees every raw transition for a key in order; `append` only ever
+  receives entries `index.mjs` has already decided are worth keeping.
+  Keeping that decision out of `log.mjs` is also what lets the bounce
+  window correctly observe a capability's *every* value (including one
+  `onChange` will end up filtering from Recent, like `alarm_contact`
+  going back to `false`) rather than only the subset `log.mjs` would
+  otherwise be shown — see `core/index.mjs` for why that distinction
+  matters.
 - `appendNotification(entry)` — same buffer, `kind: "notification"`
   (`{ ts, kind: "notification", id, ownerName, excerpt }`, `id` real and
   Homey's own). Deduping by `id` against only the last 500 buffered
@@ -338,7 +325,17 @@ Revisit this file when phase 5 actually needs persistence.
   baseline, and `appendNotification` alone can't express "mark as seen,
   but don't create a row" — that's a second, distinct operation on the
   same seen set, not a special-cased call to the first one.
-- `tail(n)` — the last `n` entries of either kind, newest first.
+- `tail(n)` — the last `n` entries of either kind, in **append** order
+  (newest-appended first), not necessarily chronological (`ts`) order.
+  Those two can differ here specifically because a bounce-delayed
+  transition (above) commits up to 2 seconds after its own `ts`, so a
+  capability change that arrived *after* it chronologically but wasn't
+  itself delayed can already be appended by the time the delayed one
+  finally commits — `tail(n)` still returns it in the order it landed in
+  the array. `core/recent.mjs`'s `list()` (below) is what sorts by `ts`
+  before rendering, so "newest first" in the row list callers actually
+  see is a real chronological ordering, not `log.mjs`'s raw append
+  order.
 
 ### `core/recent.mjs` (new)
 Derives Recent rows from `log.mjs`'s buffer, per design.md's Recent
@@ -353,6 +350,13 @@ silently break the fixture-only tests. Dependency injection here isn't
 extra ceremony, it's what makes "tested against a recorded house fixture,
 no real Homey" (this phase's own stated goal) actually true for this file:
 
+- `list()` sorts by `ts` descending before taking the top `recentRows`,
+  not by `tail()`'s raw append order — `log.mjs`'s bounce handling
+  (above) can commit a transition up to 2 seconds after its own `ts`, by
+  which point a later, undelayed transition may already be appended
+  ahead of it; sorting by `ts` here is what keeps "newest first" true to
+  actual event time rather than to whichever order things happened to
+  land in the buffer.
 - One row per log entry (no mood/flow-fold grouping yet — folding requires
   knowing *which* entries share a mood/flow cause, and phase 2 has no
   mood/flow attribution at all per the cause-tracking limitation above;
@@ -364,8 +368,9 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   all), `why` is a plain rendering of the transition (`"→ on"`, `"dimmed
   to 40%"`, `"locked"`) built from `capabilityId`/`from`/`to` — for
   `dim`/`volume_set` specifically, `from`/`to` are converted through
-  `homey.mjs`'s `toPercent()` before rendering, since the log stores
-  Homey's real normalized `0–1` value (see `core/homey.mjs` above), and
+  `homey.mjs`'s `toDisplayPercent()` before rendering, since the log
+  stores Homey's real normalized `0–1` value (see `core/homey.mjs`
+  above), and
   "dimmed to 0.4" would be wrong to show a user who thinks in percent —
   plus `"(you)"` appended when `cause` is `"prompt"` (design.md's "in/out
   filter" — the closest honest rendering of in/out attribution phase 2's
@@ -380,10 +385,11 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   (`"<device name> unlock"`/`"<device name> lock"`) are verbs the
   grammar recognizes; `dim`/`target_temperature`/`volume_set` are the
   three bare-number targets it recognizes, so their undo line is
-  `"<device name> <from-value>"` — again `toPercent()`-converted for
-  `dim`/`volume_set`, since the grammar line is meant to be typed back
-  in and the grammar only ever accepts percent input for those two, per
-  `core/homey.mjs` above. Every other member of
+  `"<device name> <from-value>"` — `toLinePercent()`-converted (not
+  `toDisplayPercent()`) for `dim`/`volume_set`, since this text is meant
+  to be typed back in and executed, and rounding it to a whole percent
+  the way `why` does would make the "undo" land on a different value
+  than the one it's supposed to restore. Every other member of
   `DISCRETE_CAPABILITIES` — `speaker_playing` (`setable`, but phase 2's
   grammar has no play/pause verb), `alarm_contact`/`alarm_motion`
   (`getable`-only, not writable at all), `windowcoverings_state` (no verb
@@ -394,6 +400,21 @@ no real Homey" (this phase's own stated goal) actually true for this file:
   so extending grammar's coverage automatically extends which
   capabilities get a real undo line, with no separate list to keep in
   sync by hand.
+
+  A `line` built from `deviceName` text is only as executable as
+  `grammar.mjs`'s own exact-match step (above) makes it: if the house
+  has two devices sharing that exact name — nothing stops that; names
+  are Homey's, not a namespace phase 2 controls — running the line lands
+  in `resolve()`'s existing ambiguous-exact-match handling
+  (`matches: [...]`, not a silent pick) exactly the same way typing that
+  same text as a fresh query would. This isn't a special failure mode
+  for `line` specifically that needs its own handling: it's the same
+  ambiguity `prompt.run` already has to handle for *any* input, and a
+  renamed device's old Recent rows go through the identical path — the
+  line still names whatever device that text resolves to *now*, which
+  may no longer be the same device if it was renamed and another device
+  since took that name (a real but narrow edge case phase 2 doesn't add
+  machinery for beyond what `resolve()` already does).
 - A `kind: "notification"` row: `{ id, kind, label, why }` — `label` is
   the entry's real `ownerName` (`"Anwesenheit"`, `"Flow"`, `"Apps"`),
   `why` is its `excerpt` verbatim. No `line`: a notification isn't a
@@ -410,17 +431,30 @@ Exactly what design.md's repo layout names it: an exact/fuzzy/thing-number
 parser, nothing wider yet.
 
 - `resolve(text, { devices, zones })` — the `prompt.resolve` implementation.
+  Its return shape is one consistent contract, not a different ad hoc
+  object per branch: always `{ matches: [...] }` (`matches` present,
+  possibly empty, on *every* return — never omitted), plus optionally
+  exactly one of `room: { id, name }` (a bare zone query) or `action: {
+  deviceId, capabilityId, value }` (a fully-resolved, ready-to-write
+  target — `value` already percent-converted for `dim`/`volume_set`, so
+  neither `run()` nor its caller needs to know which capabilities are
+  percent-displayed). `run()` (below) is defined entirely in terms of
+  this one shape: `action` present means write it, `room` present means
+  report the room, neither present means report `matches` as-is
+  (ambiguous, or nothing found — `run()` treats both the same way, since
+  there's nothing to execute either way). Without one shared success
+  shape, `resolve()`'s live-typing callers and `run()`'s own re-resolve
+  call could each end up expecting different fields for the same
+  underlying result.
+
   Splits `text` into `thing` and `rest` (first whitespace-delimited token(s)
   forming a name, greedily matched against device/zone names before falling
   back token-by-token — device/zone names are unpredictable-length, e.g.
   "Kitchen Switch"). This is a two-stage process, not five independent
   branches tried in order: stage one (exact, then fuzzy) finds the
   **thing** — a specific device or zone, or gives up — and stage two
-  decides what `rest` (if anything) means for *that* thing. An earlier
-  draft of this plan wrote stages one and two as one flat numbered list
-  and said a unique match at stage one "resolves outright," which reads
-  as stage two being unreachable; to be unambiguous, stage one only ever
-  identifies *which* device/zone `text` refers to (or that it's
+  decides what `rest` (if anything) means for *that* thing. Stage one
+  only ever identifies *which* device/zone `text` refers to (or that it's
   ambiguous, or that it's nothing) — it does not by itself produce
   `resolve()`'s final return value:
   1. **Exact** — case-insensitive full match against every device and zone
@@ -444,15 +478,17 @@ parser, nothing wider yet.
      supports a bare zone query ("`office` — a bare zone query — lists
      the Office's devices"), and `prompt.resolve`'s protocol shape
      already carries a `room?` field for exactly this, so phase 2 returns
-     `{ room: { id: zoneId, name: zone.name } }` — the name travels with
-     the id because `bin/uchi` (below) has no zone map of its own to look
-     one up in; `resolve()` already has `zones` in scope, so it's the one
-     place that can cheaply attach it. No `line`: design.md is explicit
-     that a bare zone row has none ("**Enter** pins it as Here via
-     `room.pin`," not `prompt.run`) — phase 2 doesn't implement
-     `room.pin` (see `rpc.mjs` below), so `{ room }` is as far as this
-     goes; a wrapper or `bin/uchi` that doesn't yet call `room.pin` can
-     still show the zone was recognized.
+     `{ matches: [], room: { id: zoneId, name: zone.name } }` —
+     `matches: []` alongside `room`, per the one-consistent-shape
+     contract above, not `room` on its own with the field simply absent.
+     The name travels with the id because `bin/uchi` (below) has no zone
+     map of its own to look one up in; `resolve()` already has `zones`
+     in scope, so it's the one place that can cheaply attach it. No
+     `action`: design.md is explicit that a bare zone row has none
+     ("**Enter** pins it as Here via `room.pin`," not `prompt.run`) —
+     phase 2 doesn't implement `room.pin` (see `rpc.mjs` below), so
+     `{ room }` is as far as this goes; a wrapper or `bin/uchi` that
+     doesn't yet call `room.pin` can still show the zone was recognized.
   4. Verbs (`on`, `off`, `lock`, `unlock`) — recognized as `rest` for a
      device whose `capabilitiesObj[capabilityId]` is both present *and*
      `setable` (`onoff` for on/off, `locked` for lock/unlock) — checking
@@ -461,8 +497,10 @@ parser, nothing wider yet.
      present and readable without being writable, so a read-only device
      would otherwise resolve here and only fail later, inside
      `prompt.run`, instead of failing resolution up front the way an
-     unmatched thing already does. Anything else in `rest` is parsed as a
-     bare number.
+     unmatched thing already does. A match here returns `{ matches: [],
+     action: { deviceId, capabilityId, value } }` — `value` is `true`
+     for `on`/`lock`, `false` for `off`/`unlock`. Anything else in `rest`
+     is parsed as a bare number.
   5. A bare number in `rest` resolves only if the matched thing is a
      **device** (not a zone — see the multi-kind-zone finding above) whose
      `capabilitiesObj` has exactly one `setable` entry among
@@ -474,18 +512,34 @@ parser, nothing wider yet.
      `homey.toHomeyValue()` before it's used for anything — resolving
      against the *converted* value, not the raw typed number, since a
      dim capability's real range is `0–1` (see `core/homey.mjs` above);
-     `target_temperature` is used as-is, already real degrees. Zero or
-     more-than-one such capability is a dead end with `why: "needs a
-     word"` — the real word grammar (design.md's full word list) is
-     deferred, so this phase can name the problem but not solve every
-     case; it's still strictly better than silently guessing wrong.
+     `target_temperature` is used as-is, already real degrees. The
+     converted value is then checked against that capability's own
+     `min`/`max` (real, verified fields — `dim`/`volume_set` are `0–1`,
+     this house's real thermostats are `4–35`) and out-of-range is
+     *also* a dead end, `why: "out of range (min–max)"`, resolved no
+     further than that — the same way this step already rejects
+     zero-or-ambiguous capabilities, not sent to `setCapabilityValue` at
+     all. Skipping this would let Homey decide whether to reject or
+     silently clamp an out-of-range write; either way, if `write()`
+     still recorded the *requested* value as `to` (rather than whatever
+     Homey actually applied), `currentValue` and Recent would describe a
+     state the device was never actually in. A value that passes returns
+     `{ matches: [], action: { deviceId, capabilityId, value:
+     convertedValue } }`. Zero or more-than-one such capability is a
+     dead end with `why: "needs a word"` — the real word grammar
+     (design.md's full word list) is deferred, so this phase can name
+     the problem but not solve every case; it's still strictly better
+     than silently guessing wrong.
 - `run(line, { devices, zones, setCapabilityValue })` — the `prompt.run`
-  implementation: re-resolves `line` via `resolve()`; if it resolves to
-  exactly one device+verb/value, `await`s `setCapabilityValue(device,
-  capabilityId, homeyValue)` — the already-percent-converted value from
-  `resolve()`, so `setCapabilityValue`'s caller (`core/index.mjs`, not
-  this file) never has to know which capabilities are percent-displayed.
-  `setCapabilityValue` here is **not** `core/homey.mjs`'s thin wrapper of
+  implementation: re-resolves `line` via `resolve()`. If the result has
+  `action` (the one canonical shape every writable resolution produces,
+  per the contract above), looks up the actual `device` object from
+  `devices` by `action.deviceId` and `await`s
+  `setCapabilityValue(device, action.capabilityId, action.value)` —
+  `action.value` is already percent-converted, so `setCapabilityValue`'s
+  caller (`core/index.mjs`, not this file) never has to know which
+  capabilities are percent-displayed. `setCapabilityValue` here is
+  **not** `core/homey.mjs`'s thin wrapper of
   the same name directly — `rpc.mjs` passes in `index.mjs`'s serialized
   write function (below), which performs the real write *and* returns
   `{ deviceId, deviceName, capabilityId, from, to }` itself, reading
@@ -505,12 +559,14 @@ parser, nothing wider yet.
   calls `log.append(...)`, with `result.change` plus `cause: "prompt"`,
   after `run()` itself has resolved with `{ ok: true }` — a write that
   failed or hasn't finished yet has nothing to log.
-  Ambiguous or no match returns `{ ok: false, matches }` (`bin/uchi`
-  prints the candidates and exits non-zero, per design.md's
-  one-shot-caller behavior) without calling `setCapabilityValue` at all.
-  A bare-room match (`{ room }`, no device/verb/value) also returns `{
-  ok: false, room }` from `run()` without writing anything — running a
-  room query on `Enter` isn't a write, and `bin/uchi` (below) reports it
+  A `resolve()` result with `room` instead of `action` returns `{ ok:
+  false, room }` from `run()` without calling `setCapabilityValue` at
+  all — running a room query on `Enter` isn't a write. Anything with
+  neither `action` nor `room` (ambiguous or no match — `matches` is
+  whatever `resolve()` produced, empty or not) returns `{ ok: false,
+  matches }` (`bin/uchi` prints the candidates and exits non-zero, per
+  design.md's one-shot-caller behavior), also without calling
+  `setCapabilityValue`. `bin/uchi` (below) reports the room case
   distinctly from a real failure.
 
 No `?` (list applicable words), no chaining (`,`/`;`), no exclusions
@@ -560,10 +616,11 @@ priority order itself is the same one `grammar.mjs`'s bare-number step
 already checks value-bearing capabilities in, with `onoff`/`locked`
 appended after as the two verb-only fallbacks for a device with none of
 the three value targets. `why` is that capability's current value,
-`toPercent()`-converted for `dim`/`volume_set` (e.g. `"40%"`), plain for
-`target_temperature` (e.g. `"21°"`), and `"on"`/`"off"`/`"locked"`/
-`"unlocked"` for the boolean pair; `line` is the same undo-style line
-`recent.mjs` builds for a re-apply of that one chosen capability, reusing
+`toDisplayPercent()`-converted for `dim`/`volume_set` (e.g. `"40%"`),
+plain for `target_temperature` (e.g. `"21°"`), and
+`"on"`/`"off"`/`"locked"`/`"unlocked"` for the boolean pair; `line` is
+the same `toLinePercent()`-based undo-style line `recent.mjs` builds for
+a re-apply of that one chosen capability, reusing
 that formatting logic — factor the shared from-value → line renderer
 into `grammar.mjs` so `here.mjs` and `recent.mjs` don't duplicate it, and
 apply `recent.mjs`'s same rule of omitting `line` for a capability
@@ -610,32 +667,62 @@ needs to be current *between* `state.get` calls:
   or a `true → false → true` sequence would see the second `true` as a
   no-op against a cache stuck on the first `true`, and lose a real
   Recent row.
-- The callback checks a `pendingSelfWrites` `Map` (same key shape)
-  *before* deciding to log: an entry there is `{ value, remaining, timer
-  }` — `remaining` starts at `2` (confirmed live: `setCapabilityValue`
-  triggers this callback **twice** with the same value, not once, so
-  this isn't a rare double-fire to special-case but the expected shape
-  of every self-caused write). On a matching event (same key, same
-  value), decrement `remaining`; drop the event either way (it's an
-  echo), and only delete the pending entry once `remaining` reaches `0`
-  — deleting it after the *first* matching echo, as an earlier draft of
-  this plan did, leaves the *second* echo with nothing to match against,
-  and it would be logged as an external change. `timer` is a fallback:
-  a few seconds after the entry is created, delete it regardless of
-  `remaining`, in case fewer than two echoes ever arrive for some reason
-  — a stale entry that never gets deleted would incorrectly swallow a
-  later *genuine* external write to the same value. This registry, not
-  "the log's most recent entry" (an earlier draft of this plan), is what
-  self-write detection matches against, because the echo can arrive
-  before `rpc.mjs` has even called `log.append` for the prompt-caused
-  write — matching against the log's tail is racy exactly in that
-  window; matching against a registry populated *before* the write is
-  issued (below) isn't.
-- Only once both of those pass does the callback apply the
-  `alarm_contact`/`alarm_motion` "going true" filter (design.md wants
-  only `value === true` transitions as Recent rows for these two, not
-  every transition) and call `log.append(...)` with a fresh-value dedupe
-  against `currentValue`'s *prior* value for that pair, so the first
+- The callback checks a `pendingSelfWrites` `Map`, keyed the same way,
+  of one **queue** (array) per key, not a single overwritable entry —
+  `write()` (below) can start a second write to the same capability as
+  soon as the first's Homey call resolves, which can happen before that
+  first write's two realtime echoes have both arrived (the echoes are
+  independent of the write's own HTTP-style response), so two writes to
+  the same key can genuinely have expectations in flight at once; a
+  single slot would let the second write's expectation overwrite the
+  first's before it's fully consumed. Each queued record is `{ value,
+  remaining, timer }` — `remaining` starts at `2` (confirmed live:
+  `setCapabilityValue` triggers this callback **twice** with the same
+  value, not once, so this isn't a rare double-fire to special-case but
+  the expected shape of every self-caused write). On an incoming event,
+  the callback searches the key's queue for the first record whose
+  `value` matches; if found, decrement its `remaining` and drop the
+  event (it's an echo, not a real transition), removing that record only
+  once its `remaining` reaches `0` — matching by value, not by queue
+  position, is what keeps two overlapping writes' echoes from being
+  attributed to each other. Each record's `timer` is a fallback: a few
+  seconds after it's created, remove it regardless of `remaining`, in
+  case fewer than two echoes ever arrive for some reason — a stale
+  record that's never removed would incorrectly swallow a later
+  *genuine* external write to the same value. Records are pushed
+  *before* the write they belong to is issued (below), which is what
+  makes matching against this queue safe against an echo arriving before
+  `rpc.mjs` has even called `log.append` for the prompt-caused write — a
+  check against the log's own tail instead would be racy exactly in that
+  window.
+- Only once past the echo check does the callback feed the transition
+  into bounce-tracking — a `pendingTransition` `Map`, keyed the same
+  way, holding at most one uncommitted `{ from, to, timer }` per key (the
+  same bounce mechanics `core/log.mjs` above describes, owned here
+  instead so it can see every raw transition, per that section): on a
+  key with no pending entry, start one holding this transition; on a key
+  with a pending `X → Y`
+  entry, either cancel it as a bounce (if the new value equals `X`) or
+  commit it and start a fresh pending entry for `Y → newValue` (if not),
+  as detailed under `core/log.mjs` above. **Every** transition reaches
+  this step, including an `alarm_contact`/`alarm_motion` value going
+  back to `false` — bounce-tracking has to see the real sequence of
+  values to correctly cancel a `true → false` reversion within the
+  window, which it couldn't do if `false` transitions were filtered out
+  before reaching it. The `alarm_contact`/`alarm_motion` "going true"
+  filter (design.md wants only `value === true` transitions as Recent
+  rows for these two, not every transition) is applied only at the
+  moment a transition is actually about to be committed — either
+  immediately (a further distinct change forces the prior pending entry
+  out) or when its 2-second timer fires — right before calling
+  `log.append(...)`: if the committing transition's capability is
+  `alarm_contact`/`alarm_motion` and its `to` isn't `true`, the commit is
+  silently dropped instead of calling `log.append` at all. Applying this
+  filter here, not earlier, is what lets a `true → false` within the
+  bounce window actually cancel the pending `true`, since the `false`
+  that would otherwise never have reached bounce-tracking now does.
+  `log.append` itself still applies the from-`===`-to no-op dedupe
+  against `currentValue`'s *prior* value for the pair, so the first
   fetch's already-current values don't get logged as "changes" the
   instant subscriptions start.
 
@@ -665,13 +752,14 @@ seed one from `device.capabilitiesObj[capabilityId].value` (the value
 already sitting on the resolved device object `write()` was called
 with) before reading anything, rather than reading `from` as `undefined`
 for a device this cache was never told about. Then: reads `from` from
-`currentValue`, sets `pendingSelfWrites` for that key (per the two-echo
-registry above), `await`s `homey.setCapabilityValue(device,
-capabilityId, homeyValue)`, updates `currentValue` to the new value
-immediately on success (not waiting for the realtime echo, so a same-key
-write issued right after this one still sees the right `from`), and
-returns `{ deviceId: device.id, deviceName: device.name, capabilityId,
-from, to: homeyValue }` — `deviceName` comes
+`currentValue`, pushes a fresh `{ value: homeyValue, remaining: 2, timer
+}` record onto `pendingSelfWrites`' queue for that key (per the queue
+design above — pushed, never overwriting an existing record), `await`s
+`homey.setCapabilityValue(device, capabilityId, homeyValue)`, updates
+`currentValue` to the new value immediately on success (not waiting for
+the realtime echo, so a same-key write issued right after this one still
+sees the right `from`), and returns `{ deviceId: device.id, deviceName:
+device.name, capabilityId, from, to: homeyValue }` — `deviceName` comes
 from the `device` object `write()` was called with, captured here rather
 than by `rpc.mjs` reading `devices[change.deviceId].name` after the
 `await` returns: `state.get` can replace the whole `devices` map object
@@ -679,9 +767,12 @@ while this write is in flight, so a lookup against `devices` *after*
 awaiting reads whatever the variable currently points to, not
 necessarily the map this call started against — reading `device.name`
 directly off the already-resolved object handed to `write()` has no such
-window. A rejected `homey.setCapabilityValue` call clears the pending
-entry it set (so a failed write doesn't leave a phantom echo expectation
-behind) and rethrows, for `grammar.run` to catch (see above).
+window. A rejected `homey.setCapabilityValue` call removes the specific
+record this call pushed (identified by object reference, not by value —
+another same-key write could have pushed a record with the same value in
+the meantime) from the queue, so a failed write doesn't leave a phantom
+echo expectation behind, and rethrows, for `grammar.run` to catch (see
+above).
 
 `devices`/`zones`/`moods`/`users` plus an in-memory `context` object (`{
 machineRoom: null, idle: null, mic: null, media: null }`, updated only by
@@ -698,47 +789,59 @@ reads are always fresh: a device added after the core started would show
 up in `here`/grammar (next `state.get`, real data) but never generate a
 Recent row (no subscription was ever created for it), and a device
 removed or replaced leaves a harmlessly-inert listener. This is the
-direct, previously-undocumented consequence of the "refetch don't
-resubscribe" choice above, not a new decision — phase 2 doesn't attempt
+direct consequence of the "refetch don't resubscribe" choice above, not
+a separate decision — phase 2 doesn't attempt
 to reconcile subscriptions against topology changes; a core restart
 (already the standard recovery path for a settings change, per phase 1)
 picks up any added/removed device.
 
-Notification polling: call `homey.getNotifications(api)` **once,
-immediately** (not inside the interval) right after the block above.
-Only once that call *succeeds* does its result seed
-`log.seedNotificationIds(...)` (never `appendNotification` — Homey's
-notification list is real, persistent history, this house alone has 250
-real entries going back weeks, not a live-only feed, so appending
-everything already present on first connect would flood Recent with
-pre-core history in one shot) and does `setInterval(..., 30_000)` start,
-polling the same `getNotifications(api)` on a repeat and appending only
-entries whose `id` isn't already in the seen set. If the immediate seed
-call *fails*, it does not fall through to starting the interval with an
-empty seen set — that would make the interval's first successful poll
-treat the *entire* real notification history as new, exactly the flood
-the seed step exists to prevent. Instead it retries itself every 5
-seconds (its own short interval, separate from and replaced by the real
-30s one once it succeeds) until a `getNotifications()` call finally
-succeeds, then proceeds to seed and start the real interval as above. Doing the first
-poll immediately and outside the interval, rather than letting
-`setInterval` fire its first callback after the usual 30-second delay,
-matters because `setInterval` genuinely doesn't run its callback until
-the interval elapses: a notification created in that gap between "core
-started" and "first interval fire" would otherwise get folded into the
-*baseline* seed instead of being correctly treated as new. Every poll
-from the real 30s interval onward is wrapped so a rejected
-`getNotifications()` call is caught and logged via `console.error`, not
-left to reject an unhandled interval callback — a transient failure
-skips that one poll and the next scheduled one retries; it must not be
-able to take the whole core down, unlike the startup fetch's `exit(69)`,
-which is appropriate only for the one-time initial connection check. No
-realtime "notification created" push was found or verified in
-`homey-api`'s exposed surface (unlike capability changes, which
-genuinely are push-based), so polling is the honest approach here, not a
-shortcut; 30s balances staleness against hammering the API for a row
-kind that's inherently lower-frequency than capability changes. This is
-a deliberate, narrow exception to design.md's "Explicitly decided
+Notification polling is started, not awaited, right after the block
+above — `rpc.listen()` (phase 1's existing call, unchanged in phase 2)
+must not wait on it: notifications are optional, best-effort Recent
+content, and Homey's core device connection already succeeded by this
+point (that's what the earlier `exit(69)` gate already guarantees), so
+an outage in specifically the notifications endpoint must not delay
+`state.get`/`prompt.run` becoming available at all.
+
+The polling itself is one recursive `setTimeout` loop, not a bare
+`setInterval`, with a module-level `notificationsSeeded` boolean guard
+(`false` until the first successful fetch) — a plain interval-based
+retry has no such guard and can't prevent two overlapping attempts (one
+slow fetch still in flight when the next retry fires) from each
+independently succeeding and each seeding/starting their own polling
+cadence. The loop's body: call `homey.getNotifications(api)`; on
+success, if `notificationsSeeded` is still `false`, this is the seed
+call — capture `startupCutoff` as the timestamp taken *before* this
+call was made, mark every returned entry whose `dateCreated <=
+startupCutoff` as seen via `log.seedNotificationIds(...)` (established
+history, not appended), and `log.appendNotification(...)` any entry
+whose `dateCreated > startupCutoff` (genuinely created while this first
+fetch was in flight, not pre-core history — appending it, not just
+seeding it, is what keeps a notification created in that narrow window
+from being silently absorbed into the baseline and never shown), then
+set `notificationsSeeded = true` and schedule the next call in `30_000`
+ms. If `notificationsSeeded` is already `true` (this is an ordinary
+ongoing poll, not the seed), just `appendNotification` any entry whose
+`id` isn't already in the seen set, as before, and schedule the next
+call in `30_000` ms. On failure: log the error via `console.error` and
+schedule a retry — in `5_000` ms if `notificationsSeeded` is still
+`false` (still trying to establish the baseline), or in `30_000` ms if
+it's already `true` (an ordinary poll just had a transient failure, the
+regular cadence already covers retrying it). Scheduling the *next* call
+only after the *current* one finishes — success or failure — is what a
+recursive `setTimeout` gives for free and a bare `setInterval` doesn't:
+there's never a second call in flight while the first is still running,
+so nothing can double-seed or start the real cadence twice. Homey's
+notification list is real, persistent history (this house alone has 250
+real entries going back weeks), not a live-only feed, which is why the
+seed/append distinction above exists at all — appending everything
+already present on first connect would flood Recent with pre-core
+history in one shot. No realtime "notification created" push was found
+or verified in `homey-api`'s exposed surface (unlike capability changes,
+which genuinely are push-based), so polling is the honest approach here,
+not a shortcut; 30s balances staleness against hammering the API for a
+row kind that's inherently lower-frequency than capability changes. This
+is a deliberate, narrow exception to design.md's "Explicitly decided
 against: Polling — replaced by `homey-api` realtime events" — that
 decision is about *capability* state, which stays fully push-based and
 unchanged here; notifications are a different data source with no push
@@ -751,6 +854,24 @@ Untouched — phase 1 already factored dispatch as a plain `{method:
 handler}` table passed in from `index.mjs`; phase 2 just grows that table
 in `index.mjs`:
 
+- `state.get` refetches `devices`/`zones`/`moods`/`users` and publishes
+  them into the shared variables the rest of the `methods` table closures
+  over (see `core/index.mjs` above) — but the RPC server (phase 1's
+  `rpc.mjs`) already handles each incoming line independently, so two
+  overlapping `state.get` calls (nothing prevents a client sending two in
+  quick succession) can have their fetches resolve out of order: the
+  *slower* of the two would otherwise publish its (now stale) snapshot
+  *after* the faster one already published a newer one, leaving every
+  later Here/grammar/write call reading data older than what a client
+  already saw. `state.get`'s handler guards against this with a single
+  module-level generation counter: increment it and capture the new
+  value before starting the four fetches, then after they resolve, only
+  publish to the shared variables `if` the captured generation still
+  equals the current one — i.e., no newer `state.get` call has started
+  in the meantime. A superseded response still returns its own freshly
+  fetched data to *its own* caller (nothing wrong with what it fetched,
+  only with letting it overwrite something newer), it just doesn't
+  publish that snapshot for everyone else to read afterward.
 - `state.get` → real `{ hero, recent, attention: [], here, habits: [] }`.
   Both `hero.room` and the top-level `here` are the *same*
   `here.mjs`-computed value (`compute(context.machineRoom, ...)`) —
@@ -814,22 +935,18 @@ Habits/pinning are themselves real.
 
 ### `bin/uchi` (extend)
 Add `uchi status` (below) and `uchi setup`/`uchi rpc` (phase 1, unchanged)
-as named subcommands, checked *before* anything else. Only once none of
-those three match is the invocation treated as a prompt line — `bin/uchi
+as named subcommands, checked *before* anything else — checking them
+first, not a catch-all phrased as "anything that isn't `setup` or `rpc`,"
+is what correctly excludes `status` from being sent to `prompt.run` as
+the literal text `"status"`. Only once none of the three named
+subcommands match is the invocation treated as a prompt line — `bin/uchi
 desk 40` joins `argv.slice(2)` with spaces and sends it as `prompt.run {
-line }`. Checking the named subcommands first, not last, is what a
-"anything that isn't `setup` or `rpc`" catch-all (an earlier draft of
-this plan) gets wrong: `status` isn't `setup` or `rpc` either, so that
-phrasing would send the literal text `"status"` to `prompt.run` instead
-of ever reaching the `uchi status` handling described below. On `{ ok:
-true }`, exit 0 silently (matching a
-successful command-line tool's convention). On failure, `prompt.run` can
-come back three different shapes (per `core/grammar.mjs`'s `run()`
-above), checked in this order — checking `matches.length` first, before
-confirming `matches` is even the field present, is what an earlier draft
-of this plan did and is exactly the bug: a real write failure has no
-`matches` at all, so reaching straight for `.length` on it would throw or
-misreport:
+line }`. On `{ ok: true }`, exit 0 silently (matching a successful
+command-line tool's convention). On failure, `prompt.run` can come back
+three different shapes (per `core/grammar.mjs`'s `run()` above), and the
+dispatch must check for `error` and `room` *before* touching `matches` —
+a real write failure carries no `matches` field at all, so checking
+`matches.length` first would throw or misreport on that case:
 - `{ error }` — the write itself failed (Homey rejected it, or the
   request errored): print `error` and exit 1.
 - `{ room }` — a bare zone query, not a failure to disambiguate: print
@@ -874,20 +991,26 @@ table.
 
 ### `core/test/grammar.test.mjs`, `core/test/recent.test.mjs`, `core/test/here.test.mjs` (new)
 Against `fixture.mjs`, `node --test`:
-- Grammar: `"desk 40"` resolves to the Desk Lamp with a *converted*
-  target of `0.4` (design.md's own first example row, plus the
-  percent→normalized conversion this plan adds — asserting the raw
-  resolved value, not just that it resolves at all, is what would have
-  caught the original percent/normalized gap); `"kitchen+office"`-style
-  joins are **not** tested since chaining/join is out of phase 2's scope
-  — instead assert that a query naming a multi-kind zone (Living Room:
-  lights + speaker + thermostat) with a bare number returns the "needs a
-  word" dead end, not a guess; assert `"front door"` resolves to the
-  Front Door lock uniquely; assert a bare `"office"` (no verb/value)
-  resolves to `{ room: { id: <Office's zone id>, name: "Office" } }`;
-  assert two fixture entries
-  sharing an exact name (added to the fixture specifically for this
-  case) resolve as ambiguous `matches`, not an arbitrary pick.
+- Grammar: `"desk 40"` resolves to `{ matches: [], action: { deviceId:
+  <Desk Lamp's id>, capabilityId: "dim", value: 0.4 } }` (design.md's own
+  first example row, plus the percent→normalized conversion this plan
+  adds — asserting the exact resolved `action`, not just that it
+  resolves at all, is what would have caught the original
+  percent/normalized gap); a value outside a capability's `min`/`max`
+  (e.g. a temperature past 35°) returns the out-of-range dead end, not a
+  clamped or rejected write attempt; `"kitchen+office"`-style joins are
+  **not** tested since chaining/join is out of phase 2's scope — instead
+  assert that a query naming a multi-kind zone (Living Room: lights +
+  speaker + thermostat) with a bare number returns the "needs a word"
+  dead end, not a guess; assert `"front door unlock"` (design.md's own
+  example, with the verb — a bare device name with no verb/value has no
+  defined resolution in phase 2 and isn't tested as if it did) resolves
+  to `{ matches: [], action: { deviceId: <Front Door's id>,
+  capabilityId: "locked", value: false } }`; assert a bare `"office"`
+  (no verb/value) resolves to `{ matches: [], room: { id: <Office's zone
+  id>, name: "Office" } }`; assert two fixture entries sharing an exact
+  name (added to the fixture specifically for this case) resolve as
+  ambiguous `matches`, not an arbitrary pick.
 - Recent: appending a log entry and reading it back renders the expected
   `why`/`line`, including the `dim`/`volume_set` percent-conversion (a
   raw `0.4` entry renders `"40%"`, not `"0.4%"` or `"0.4"`); a
