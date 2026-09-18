@@ -375,6 +375,19 @@ anticipated above:
   outside the card border rather than being cut off or scrollable. `bodyColumn` is now wrapped in
   a `Flickable` (`clip: true`, `boundsBehavior: Flickable.StopAtBounds`), the same fix
   `omarchy.clock`'s own calendar content already uses for the same reason.
+- **An externally triggered onoff+dim pair still doubled up.** The earlier `pendingSelfWrites`
+  fix only covers *our own* writes cascading `dim`→`onoff` — it has nothing to do with a flow or
+  the Homey app setting both `onoff` and a numeric target on one device as two separate external
+  capability changes, arriving close together in either order (observed both ways: onoff-then-dim
+  turning a light on to a level, dim-then-onoff turning it off). Neither event is a self-write
+  echo, so `pendingSelfWrites` never sees either side. `onChange` now folds them for any device
+  that actually has a numeric target capability (a plain onoff-only device — a socket, a lock —
+  can't produce this pattern and logs immediately, unaffected): a numeric-target change records
+  `lastNumericChangeAt` and cancels any already-pending onoff row for that device; an `onoff`
+  change checks that timestamp (covers numeric-then-onoff) and, if nothing recent, holds for
+  `ONOFF_FOLD_WINDOW_MS` (500ms) before logging, canceled if a numeric-target change arrives in
+  that window (covers onoff-then-numeric). The 500ms figure is a guess wide enough to cover what
+  was actually observed, not confirmed against a flow's real timing.
 
 ## After this phase
 
