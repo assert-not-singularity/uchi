@@ -1,3 +1,22 @@
+Uchi core — the Homey connection, grammar/fuzzy-matching, and ranking logic.
+Copyright (C) 2026 Niklas Puller
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version. This program is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the full license
+text below for details.
+
+Not retroactive: code in core/ as of commit 4d3e7aa (2026-09-17), the last
+commit before this license took effect, was originally published under the
+MIT License and remains available under those terms to anyone who already
+has or obtains a copy of it at or before that commit. This GPL applies to
+core/ from that point forward.
+
+--------------------------------------------------------------------------
+
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 

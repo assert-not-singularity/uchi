@@ -13,6 +13,8 @@ Early development; not yet installable or usable end to end.
 
 ## License
 
-[MIT](LICENSE), except `core/`, which is [GPLv3](core/LICENSE) — the core owns the
-Homey connection, grammar, and ranking logic; wrappers (the Omarchy plugin, a
-future TUI) stay MIT so anyone can build one without adopting GPL themselves.
+[MIT](LICENSE), except `core/`, which is [GPLv3 or later](core/LICENSE) as of
+commit `4d3e7aa` forward (not retroactive — see that file) — the core owns
+the Homey connection, grammar, and ranking logic; wrappers (the Omarchy
+plugin, a future TUI) stay MIT so anyone can build one without adopting GPL
+themselves.
