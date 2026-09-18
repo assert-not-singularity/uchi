@@ -1,10 +1,15 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
+import Quickshell.Services.Pipewire
+import Quickshell.Services.Mpris
 
-// Spawns or connects to the uchi core over its Unix socket and exposes cached
-// connection state to `omarchy shell uchi ping`. Owns no ranking/grammar logic —
-// see docs/design.md's "Architecture: core + wrappers".
+// Spawns or connects to the uchi core over its Unix socket, owns the live
+// request/response + push-event connection `BarWidget.qml`/`Panel.qml` read
+// from, and forwards desktop context (mic/idle/media/machineRoom) the core
+// can't see on its own. Owns no ranking/grammar logic — see docs/design.md's
+// "Architecture: core + wrappers".
 Item {
   id: root
 
@@ -34,7 +39,32 @@ Item {
   readonly property bool connected: !!(activeSocket && activeSocket.connected)
   property var handshakeOk: null
   property int nextId: 1
-  property int helloRequestId: -1
+
+  // id -> callback, for the generic request/response layer below. A plain
+  // object rather than a Map: only ever mutated from within this file's own
+  // functions, never bound to from QML, so no reactivity is needed.
+  property var pendingRequests: ({})
+
+  // The last state.get result — BarWidget.qml/Panel.qml's actual data
+  // source. Refreshed once right after handshake and again on every
+  // incoming state.changed push (see handleEvent below). Named coreState,
+  // not state: QQuickItem already has a built-in `state` property (the QML
+  // States system) that this would otherwise silently shadow.
+  property var coreState: null
+
+  // 78/69 remembered past the process exit that produced them, so
+  // connectionStatus can still distinguish "never connected because not set
+  // up" from "never connected because Homey's unreachable" while a later
+  // reconnect attempt is in flight — connected/handshakeOk alone can't, since
+  // all three states present as connected: false, handshakeOk: null.
+  property int lastCoreExitCode: -1
+
+  readonly property string connectionStatus: {
+    if (root.connected && root.handshakeOk === true) return "connected"
+    if (root.lastCoreExitCode === 78) return "not-set-up"
+    if (root.lastCoreExitCode === 69) return "unreachable"
+    return "connecting"
+  }
 
   property int crashAttempts: 0
   property bool suppressSpawn: false
@@ -55,30 +85,169 @@ Item {
       console.error("uchi: XDG_RUNTIME_DIR is not set — cannot locate the core socket/lock")
   }
 
+  // Generic request/response layer: mints an id, stashes `callback` against
+  // it, writes the line. handleLine below dispatches a reply back to
+  // whichever caller sent it, matched by id — the same per-connection
+  // request/response shape docs/design.md's Protocol section describes.
   // Takes the socket explicitly rather than reading root.activeSocket
   // (Loader.item): a freshly created Socket's connected:true can complete and
   // fire onConnectionStateChanged synchronously during its own construction,
   // before the Loader has finished assigning `item` to point at it — so
   // root.activeSocket can still read the old (torn-down) value at that exact
   // instant even though `this` inside the handler is already the right object.
-  function sendHello(socket) {
-    if (!socket || !socket.connected) return
-    root.helloRequestId = root.nextId++
-    var request = {
-      id: root.helloRequestId,
-      method: "hello",
-      params: { client: "uchi-service", protocol: 1 }
+  function sendRequest(socket, method, params, callback) {
+    if (!socket || !socket.connected) {
+      if (callback) callback({ error: { message: "not connected" } })
+      return
     }
+    var id = root.nextId++
+    if (callback) root.pendingRequests[id] = callback
+    var request = { id: id, method: method, params: params || {} }
     socket.write(JSON.stringify(request) + "\n")
     socket.flush()
+  }
+
+  function sendHello(socket) {
+    root.sendRequest(socket, "hello", { client: "uchi-service", protocol: 1 }, function(message) {
+      root.handshakeOk = !!message.result
+      if (message.result) {
+        root.fetchState()
+        root.scheduleContextSend()
+      }
+    })
   }
 
   function handleLine(line) {
     var message = null
     try { message = JSON.parse(line) } catch (e) { return }
     if (!message || typeof message !== "object") return
-    if ("event" in message) return
-    if (message.id === root.helloRequestId) root.handshakeOk = !!message.result
+    if ("event" in message) { root.handleEvent(message); return }
+    var callback = root.pendingRequests[message.id]
+    if (!callback) return
+    delete root.pendingRequests[message.id]
+    callback(message)
+  }
+
+  function handleEvent(message) {
+    // The wrapper re-fetches what changed rather than trusting the push
+    // payload as authoritative data, per docs/design.md's Protocol section —
+    // sections is informational only, not consulted here.
+    if (message.event === "state.changed") root.fetchState()
+  }
+
+  function fetchState() {
+    root.sendRequest(root.activeSocket, "state.get", {}, function(message) {
+      if (message && message.result) root.coreState = message.result
+    })
+  }
+
+  function resolve(text, callback) {
+    root.sendRequest(root.activeSocket, "prompt.resolve", { text: text }, callback)
+  }
+
+  // run/pinRoom/unpinRoom re-fetch state.get themselves on success, not just
+  // on the server's own state.changed push — the socket is local, so there's
+  // no real latency cost, and it means the caller's own action reflects
+  // immediately without waiting on a round trip through the core's broadcast.
+  function run(line, callback) {
+    root.sendRequest(root.activeSocket, "prompt.run", { line: line }, function(message) {
+      if (message && message.result && message.result.ok) root.fetchState()
+      if (callback) callback(message)
+    })
+  }
+
+  function pinRoom(zoneId, callback) {
+    root.sendRequest(root.activeSocket, "room.pin", { zone: zoneId }, function(message) {
+      if (message && !message.error) root.fetchState()
+      if (callback) callback(message)
+    })
+  }
+
+  function unpinRoom(callback) {
+    root.sendRequest(root.activeSocket, "room.unpin", {}, function(message) {
+      if (message && !message.error) root.fetchState()
+      if (callback) callback(message)
+    })
+  }
+
+  // machineRoom is wrapper-local config (docs/design.md's Config section) —
+  // BarWidget.qml is the only file with a settings object to read it from,
+  // so it forwards the value in here rather than this file reading it itself.
+  property string machineRoom: ""
+
+  function setMachineRoom(zoneId) {
+    var value = zoneId || ""
+    if (value === root.machineRoom) return
+    root.machineRoom = value
+    root.scheduleContextSend()
+  }
+
+  // Mic/media/idle are all plain Quickshell QML types — the same tier of
+  // access as any other Quickshell import, gated by nothing Omarchy-specific
+  // (unlike bar.shell.firstPartyServiceFor, which only a plugin's own
+  // service, or a full "bar"-kind replacement, can actually read from).
+  readonly property var micSource: Pipewire.defaultAudioSource
+  readonly property bool micMuted: micSource && micSource.audio ? micSource.audio.muted : true
+  readonly property var micNodes: Pipewire.nodes ? Pipewire.nodes.values : []
+  readonly property var micActiveStreams: {
+    var list = []
+    for (var i = 0; i < micNodes.length; i++) {
+      var node = micNodes[i]
+      if (node && node.isStream && node.isSink === false && !node.audio?.muted) list.push(node)
+    }
+    return list
+  }
+  readonly property bool micLive: micActiveStreams.length > 0 && !micMuted
+
+  readonly property var mprisPlayers: Mpris.players ? Mpris.players.values : []
+  readonly property bool mediaPlaying: {
+    for (var j = 0; j < mprisPlayers.length; j++) {
+      if (mprisPlayers[j] && mprisPlayers[j].isPlaying) return true
+    }
+    return false
+  }
+
+  readonly property bool isIdle: idleMonitor.isIdle
+
+  onMicLiveChanged: root.scheduleContextSend()
+  onMediaPlayingChanged: root.scheduleContextSend()
+  onIsIdleChanged: root.scheduleContextSend()
+
+  function scheduleContextSend() {
+    contextDebounce.restart()
+  }
+
+  // context.set never triggers the core's own broadcast (only writes/
+  // notifications do), so the caller re-fetches state.get itself, the same
+  // self-refresh run/pinRoom/unpinRoom already do.
+  function sendContext() {
+    if (!root.connected || root.handshakeOk !== true) return
+    root.sendRequest(root.activeSocket, "context.set", {
+      mic: root.micLive,
+      idle: root.isIdle,
+      media: root.mediaPlaying,
+      machineRoom: root.machineRoom || null
+    }, function() { root.fetchState() })
+  }
+
+  Timer {
+    id: contextDebounce
+    interval: 250
+    repeat: false
+    onTriggered: root.sendContext()
+  }
+
+  PwObjectTracker { objects: root.micSource ? [root.micSource] : [] }
+
+  // This plugin's own idle detection, not the shell's screensaver/lock
+  // timeout (that config value is one of the fields
+  // bar.shell.firstPartyServiceFor("omarchy.idle") would gate off from a
+  // third-party plugin anyway) — 5 minutes is a plain, undocumented default,
+  // not read from anywhere.
+  IdleMonitor {
+    id: idleMonitor
+    enabled: true
+    timeout: 300
   }
 
   function scheduleSpawn(delayMs) {
@@ -128,6 +297,7 @@ Item {
   // core's own clean idle-exit; anything else is a genuine crash.
   function handleCoreExit(exitCode) {
     var code = Number(exitCode)
+    root.lastCoreExitCode = code
     if (code === 75) {
       var reason = String(coreStderr.text || "").trim()
       if (reason) console.error("uchi: flock could not acquire the core lock: " + reason)
@@ -179,6 +349,9 @@ Item {
           root.sendHello(this)
         } else {
           root.handshakeOk = null
+          // Whatever's still pending will never get a reply on this socket —
+          // drop it rather than leak callbacks across reconnects.
+          root.pendingRequests = ({})
         }
       }
     }
@@ -262,6 +435,15 @@ Item {
     }
   }
 
+  // Panel open/close/toggle are hooked in by BarWidget.qml once it's loaded
+  // — only one IpcHandler can own a given target, and this one already owns
+  // "uchi" for ping(), so BarWidget.qml's own lifecycle methods are reached
+  // through these callback properties rather than a second IpcHandler
+  // duplicating the target (which Quickshell silently drops one of).
+  property var _openPanel: null
+  property var _closePanel: null
+  property var _togglePanel: null
+
   IpcHandler {
     target: "uchi"
 
@@ -269,5 +451,11 @@ Item {
       if (root.connected && root.handshakeOk === true) return "ok"
       return "error: not connected to uchi core"
     }
+
+    function open(): void { if (root._openPanel) root._openPanel() }
+    function close(): void { if (root._closePanel) root._closePanel() }
+    function show(): void { if (root._openPanel) root._openPanel() }
+    function hide(): void { if (root._closePanel) root._closePanel() }
+    function toggle(): void { if (root._togglePanel) root._togglePanel() }
   }
 }

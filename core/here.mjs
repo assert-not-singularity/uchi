@@ -46,9 +46,11 @@ function renderDevice(device) {
     : formatCapabilityWhy(pick.capabilityId, pick.value);
   const line = pick.noLine ? undefined : lineFor(device.name, pick.capabilityId, pick.value);
 
-  return line
-    ? { id: device.id, label: device.name, why, line }
-    : { id: device.id, label: device.name, why };
+  // deviceId/capabilityId (not just the `line`, which reflects the device's
+  // *current* value) let a client build an "all off" loop over onoff-capable
+  // rows without replaying an already-on row's line and leaving it on.
+  const base = { id: device.id, label: device.name, why, deviceId: device.id, capabilityId: pick.capabilityId };
+  return line ? { ...base, line } : base;
 }
 
 // Here is flat — zones[zoneId].parent (the zone tree) is unused this phase.

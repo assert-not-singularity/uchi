@@ -80,8 +80,17 @@ function matchThing(tokens, all) {
   return { matches: [], consumed: 0 };
 }
 
+// A single common letter can substring-match most of a real house (level C
+// falls back to this at k=1) — capped so a wrapper's candidate list stays
+// something a person can actually scan, not a rendering hazard.
+const MAX_AMBIGUOUS_MATCHES = 20;
+
 function ambiguous(matches, zones) {
-  return { matches: matches.map((t) => ({ label: qualifyLabel(t, zones), why: "ambiguous — pick one" })) };
+  return {
+    matches: matches
+      .slice(0, MAX_AMBIGUOUS_MATCHES)
+      .map((t) => ({ label: qualifyLabel(t, zones), why: "ambiguous — pick one" })),
+  };
 }
 
 function deadEnd(label, why) {

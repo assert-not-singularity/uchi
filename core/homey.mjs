@@ -24,6 +24,12 @@ export async function getNotifications(api) {
   return api.notifications.getNotifications();
 }
 
+// A Homey Group (created via Homey's own "Groups" app) shows up as an
+// ordinary device with this driverId and its member device ids in
+// settings.deviceIds — confirmed live, not documented anywhere in
+// homey-api's own types.
+export const GROUP_DRIVER_ID = "homey:virtualdrivergroup:driver";
+
 // The Uchi artifact's Recent "In" list, more precise than design.md's own
 // prose summary — see docs/phase-2-plan.md's core/validate.mjs bullet.
 export const DISCRETE_CAPABILITIES = new Set([

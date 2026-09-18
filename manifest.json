@@ -4,7 +4,14 @@
   "name": "Uchi",
   "version": "0.1.0",
   "license": "MIT AND GPL-3.0-or-later",
-  "kinds": ["service"],
+  "kinds": ["service", "bar-widget"],
   "keepLoaded": true,
-  "entryPoints": { "service": "Service.qml" }
+  "entryPoints": { "service": "Service.qml", "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Uchi",
+    "description": "A command-line interface to your Homey Pro smart home — prompt, Recent, and Here in a bar panel.",
+    "category": "Utility",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
 }
