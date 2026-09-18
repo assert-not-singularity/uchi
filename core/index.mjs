@@ -23,6 +23,13 @@ const IDLE_EXIT_MS = 60_000;
 const NOTIFICATION_POLL_MS = 30_000;
 const NOTIFICATION_RETRY_MS = 5_000;
 const SELF_WRITE_ECHO_TIMEOUT_MS = 5_000;
+// A flow/mood setting both onoff and a numeric target (dim, say) on one
+// device issues them as two separate capability writes — neither is our own
+// write, so pendingSelfWrites never sees either. This window is how close
+// together they have to arrive to fold into the numeric-target row alone;
+// not independently confirmed against a live flow's actual timing, just
+// wide enough to cover the two-events-in-quick-succession pattern observed.
+const ONOFF_FOLD_WINDOW_MS = 500;
 
 function socketPathFromEnv() {
   const runtimeDir = process.env.XDG_RUNTIME_DIR;
@@ -160,6 +167,26 @@ async function main() {
     return null;
   }
 
+  function deviceHasNumericTarget(deviceId) {
+    const capsObj = devices[deviceId]?.capabilitiesObj ?? {};
+    return NUMERIC_TARGETS.some((id) => capsObj[id] !== undefined);
+  }
+
+  // deviceId -> ms timestamp of its last externally observed numeric-target
+  // change, and deviceId -> a still-pending onoff log waiting to see
+  // whether one arrives. Only devices with a numeric target at all go
+  // through this — a plain onoff-only device (a socket, a lock) can never
+  // produce the cascade this exists to fold, so it logs immediately as
+  // before.
+  const lastNumericChangeAt = new Map();
+  const pendingOnoffLog = new Map();
+
+  function logCapabilityChange({ deviceId, capabilityId, from, to }) {
+    const deviceName = devices[deviceId]?.name ?? startupDeviceNames.get(deviceId);
+    const zoneName = zones[devices[deviceId]?.zone]?.name;
+    if (log.append({ deviceId, deviceName, zoneName, capabilityId, from, to, cause: null })) notifyChanged();
+  }
+
   function onChange({ deviceId, capabilityId, value }) {
     const key = keyFor(deviceId, capabilityId);
     const from = currentValue.get(key);
@@ -179,9 +206,36 @@ async function main() {
 
     if (groupIdForMember(deviceId)) return;
 
-    const deviceName = devices[deviceId]?.name ?? startupDeviceNames.get(deviceId);
-    const zoneName = zones[devices[deviceId]?.zone]?.name;
-    if (log.append({ deviceId, deviceName, zoneName, capabilityId, from, to: value, cause: null })) notifyChanged();
+    if (deviceHasNumericTarget(deviceId)) {
+      if (NUMERIC_TARGETS.includes(capabilityId)) {
+        lastNumericChangeAt.set(deviceId, Date.now());
+        // A pending onoff row for this device is redundant now — the
+        // numeric-target row about to be logged already covers the action.
+        const pending = pendingOnoffLog.get(deviceId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingOnoffLog.delete(deviceId);
+        }
+        logCapabilityChange({ deviceId, capabilityId, from, to: value });
+        return;
+      }
+
+      if (capabilityId === "onoff") {
+        const recentNumericAt = lastNumericChangeAt.get(deviceId);
+        if (recentNumericAt && Date.now() - recentNumericAt <= ONOFF_FOLD_WINDOW_MS) return;
+
+        const existingPending = pendingOnoffLog.get(deviceId);
+        if (existingPending) clearTimeout(existingPending.timer);
+        const timer = setTimeout(() => {
+          pendingOnoffLog.delete(deviceId);
+          logCapabilityChange({ deviceId, capabilityId, from, to: value });
+        }, ONOFF_FOLD_WINDOW_MS);
+        pendingOnoffLog.set(deviceId, { timer });
+        return;
+      }
+    }
+
+    logCapabilityChange({ deviceId, capabilityId, from, to: value });
   }
 
   subscribeToDiscreteChanges(devices, onChange);
