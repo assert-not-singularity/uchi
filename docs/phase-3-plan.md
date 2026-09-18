@@ -57,12 +57,13 @@ plugins already present (`quickshell.spotify`, `omarchy.tailscale`), not assumed
   client-side from the existing row shape either: a Here/Hero device row is `{ id, label, why,
   line? }` — it doesn't expose which capability `line` targets or the device's raw `onoff`
   value, and `here.mjs`'s own picker can surface a different capability (`dim`, say) for a
-  device that also has `onoff` on. A `prompt.run`-loop over rendered rows genuinely cannot
-  identify "every device that's on." This needs a small core addition, not client assembly: add
+  device that also has `onoff` on. This needs a small core addition, not client assembly: add
   `deviceId`/`capabilityId` to the Here device row shape (the one row-shape change this phase
-  makes), so `a` becomes a client-side loop of `prompt.run` calls over rows whose `capabilityId
-  === "onoff"`, run in sequence (not `Promise.all` — `core/index.mjs`'s write serialization is
-  per-capability-key, not a bulk primitive).
+  makes), so `a` becomes a client-side loop over Here's rows with `capabilityId === "onoff"`,
+  sending `prompt.run("<label> off")` for each — built directly, not `row.line` (which reflects
+  the device's *current* value, so an already-on row's line is `"<label> on"` and would leave it
+  on if replayed). No current-value field needed: an off write to an already-off device is a
+  harmless no-op. Runs in sequence, not `Promise.all` — writes serialize per capability key.
 - `x`/`s` (dismiss/snooze/mute) have nothing to act on — Attention and Habits are empty arrays
   until phases 4–5. Bind the keys to no-ops (or omit them) rather than call
   `row.dismiss`/`row.snooze`/`row.mute`, which don't exist as RPC methods yet either.
@@ -126,13 +127,16 @@ state-owning daemon the other two files read from — the same shape `quickshell
   `BarWidget.qml` can actually read, since `connected`/`handshakeOk` alone can't distinguish
   "never connected because not set up" from "never connected because Homey's unreachable" from
   "reconnecting right now" (all three present as `connected: false, handshakeOk: null`).
-- Context forwarding: read `Pipewire.defaultAudioSource`-based mic-in-use directly (mirroring
-  `Microphone.qml`'s `inUse`), the first-party idle/media services via
-  `PluginFirstPartyServiceApi.qml`, and `machineRoom` from this plugin's own setting
-  (`root.setting("machineRoom", null)`, no live signal). On any of the four changing, call
-  `context.set` through the request layer above — debounce with a short (e.g. 250ms) timer so a
-  burst of rapid signal changes (mic toggling, a track change) collapses into one call rather
-  than one per signal tick.
+- Context forwarding: mic via `Pipewire.defaultAudioSource` directly (mirroring `Microphone.qml`'s
+  `inUse`), idle/media via `PluginFirstPartyServiceApi.qml`. `machineRoom` is wrapper-local
+  config, but its read path from `Service.qml` is **unconfirmed, not `root.setting(...)`** —
+  that's a `BarWidget`-only function, and `Service.qml` is a plain `Item`. Verify the actual
+  access path during implementation.
+- Send an initial `context.set` right after handshake, not only on later changes — otherwise the
+  core sits at its null startup defaults until something happens to change. Debounce subsequent
+  changes (~250ms) so a burst collapses into one call. `context.set` never triggers the core's
+  own broadcast (only writes/notifications do), so call `state.get` again immediately after every
+  successful `context.set` — the same self-refresh `run`/`pinRoom`/`unpinRoom` already do.
 - Exposed to `BarWidget.qml`/`Panel.qml` via `bar.shell.serviceFor("uchi")`, mirroring
   `quickshell.spotify`'s own pattern exactly — confirm the precise accessor name against that
   real file during implementation rather than guessing it here.
