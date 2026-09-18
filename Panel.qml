@@ -85,22 +85,26 @@ Panel {
     root.cursorIndex = Math.max(0, Math.min(root.activeRows.length - 1, root.cursorIndex + delta))
   }
 
-  // Clears the prompt after a real action (room pin or line run), not after
-  // an inert activation (an informational row with no line) — the resting
-  // body is where the effect of the action is actually visible, and it
-  // never renders while the prompt still holds text.
+  // Clears the prompt after a real action (room pin or line run) succeeds,
+  // not eagerly and not after an inert activation (an informational row
+  // with no line) — the resting body is where the effect of the action is
+  // actually visible, and it never renders while the prompt still holds
+  // text, but a failed pin/run (socket down, rejected zone, a write that
+  // errored) must leave the query in place rather than silently discard it.
   function activateCursor() {
     var entry = root.cursorEntry
     if (!entry || !uchi) return
     if (entry.kind === "room") {
-      uchi.pinRoom(entry.room.id)
-      root.promptText = ""
+      uchi.pinRoom(entry.room.id, function(message) {
+        if (message && !message.error) root.promptText = ""
+      })
       return
     }
     var row = entry.row
     if (row && row.line) {
-      uchi.run(row.line)
-      root.promptText = ""
+      uchi.run(row.line, function(message) {
+        if (message && message.result && message.result.ok) root.promptText = ""
+      })
     }
   }
 

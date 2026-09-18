@@ -206,14 +206,24 @@ async function main() {
     // the same device — pre-register that expected echo too, or it reads as
     // an externally caused "on" and logs its own Recent row alongside the
     // dim/volume/temperature row that already covers the same user action.
+    // Only when the device is actually off first: an already-on device's
+    // dim write triggers no cascade, and registering an echo nobody sends
+    // would sit in pendingSelfWrites for the full timeout, ready to
+    // misattribute an unrelated later onoff:true as this write's echo.
     let onoffKey = null;
     let onoffRecord = null;
     if (NUMERIC_TARGETS.includes(capabilityId) && homeyValue > 0 && device.capabilitiesObj?.onoff?.setable) {
-      onoffKey = keyFor(device.id, "onoff");
-      onoffRecord = { value: true, remaining: 2, timer: null };
-      onoffRecord.timer = setTimeout(() => evictRecord(onoffKey, onoffRecord), SELF_WRITE_ECHO_TIMEOUT_MS);
-      if (!pendingSelfWrites.has(onoffKey)) pendingSelfWrites.set(onoffKey, []);
-      pendingSelfWrites.get(onoffKey).push(onoffRecord);
+      const onoffCacheKey = keyFor(device.id, "onoff");
+      const onoffCurrentValue = currentValue.has(onoffCacheKey)
+        ? currentValue.get(onoffCacheKey)
+        : device.capabilitiesObj?.onoff?.value;
+      if (onoffCurrentValue !== true) {
+        onoffKey = onoffCacheKey;
+        onoffRecord = { value: true, remaining: 2, timer: null };
+        onoffRecord.timer = setTimeout(() => evictRecord(onoffKey, onoffRecord), SELF_WRITE_ECHO_TIMEOUT_MS);
+        if (!pendingSelfWrites.has(onoffKey)) pendingSelfWrites.set(onoffKey, []);
+        pendingSelfWrites.get(onoffKey).push(onoffRecord);
+      }
     }
 
     try {
@@ -345,12 +355,18 @@ async function main() {
       if (typeof zone !== "string" || !zones[zone]) {
         throw new Error(`room.pin: unknown zone "${zone}"`);
       }
-      pinnedRoom = zone;
+      if (pinnedRoom !== zone) {
+        pinnedRoom = zone;
+        notifyChanged();
+      }
       return {};
     },
 
     "room.unpin": async () => {
-      pinnedRoom = null;
+      if (pinnedRoom !== null) {
+        pinnedRoom = null;
+        notifyChanged();
+      }
       return {};
     },
 
