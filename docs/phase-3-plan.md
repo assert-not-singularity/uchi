@@ -53,11 +53,16 @@ plugins already present (`quickshell.spotify`, `omarchy.tailscale`), not assumed
   grammar support (still deferred, no phase attached). Wire the keys but have them no-op with a
   console warning rather than send `grammar.mjs` a line it can't parse — do **not** implement
   notch parsing here just to make the key do something.
-- `a` (all off) has no named protocol method anywhere in `design.md` — it isn't `prompt.run`-able
-  as a single line. This plan implements it client-side as a loop of `prompt.run` calls, one per
-  currently-active device in `hero`/`here`'s device list with a setable `onoff`, run in sequence
-  (not `Promise.all`, since `core/index.mjs`'s write serialization is per-capability-key, not a
-  bulk primitive) — not a new RPC method. Revisit if this proves too slow in practice.
+- `a` (all off) has no named protocol method anywhere in `design.md`, and can't be built
+  client-side from the existing row shape either: a Here/Hero device row is `{ id, label, why,
+  line? }` — it doesn't expose which capability `line` targets or the device's raw `onoff`
+  value, and `here.mjs`'s own picker can surface a different capability (`dim`, say) for a
+  device that also has `onoff` on. A `prompt.run`-loop over rendered rows genuinely cannot
+  identify "every device that's on." This needs a small core addition, not client assembly: add
+  `deviceId`/`capabilityId` to the Here device row shape (the one row-shape change this phase
+  makes), so `a` becomes a client-side loop of `prompt.run` calls over rows whose `capabilityId
+  === "onoff"`, run in sequence (not `Promise.all` — `core/index.mjs`'s write serialization is
+  per-capability-key, not a bulk primitive).
 - `x`/`s` (dismiss/snooze/mute) have nothing to act on — Attention and Habits are empty arrays
   until phases 4–5. Bind the keys to no-ops (or omit them) rather than call
   `row.dismiss`/`row.snooze`/`row.mute`, which don't exist as RPC methods yet either.
@@ -76,11 +81,18 @@ delivery guarantee — a client that's mid-reconnect simply misses it and catche
 
 ### `core/index.mjs` (extend)
 
-- After a `prompt.run` write settles, after `log.appendNotification`, and after an externally
-  observed capability change logs a Recent row (`onChange`, phase 2), call
-  `rpc.broadcast({ sections: ["recent", "hero", "here"] })` — the panel re-fetches via
-  `state.get` on receipt rather than trusting the push payload as authoritative data, per
-  `design.md`'s own protocol note ("wrapper re-fetches what changed").
+- `log.append`/`log.appendNotification` currently return nothing; make both return whether they
+  actually inserted a row (`false` for `append`'s existing `from === to` no-op case and for
+  `appendNotification`'s existing already-seen-id case). The 30s notification poll calls
+  `appendNotification` once per returned entry regardless of whether it's new — broadcasting
+  unconditionally on every call would fire a `state.changed` (and a client re-fetch) every 30s
+  even when nothing changed. Broadcast only when at least one call in a batch returned `true`:
+  after a `prompt.run` write settles, after an externally observed capability change logs a
+  Recent row (`onChange`, phase 2 — always `true`, `onChange` only calls `append` for a real
+  transition), and after a notification poll where at least one `appendNotification` call
+  returned `true`. Payload: `rpc.broadcast({ sections: ["recent", "hero", "here"] })` — the panel
+  re-fetches via `state.get` on receipt rather than trusting the push payload as authoritative
+  data, per `design.md`'s own protocol note ("wrapper re-fetches what changed").
 - Add `room.pin { zone }` and `room.unpin {}` methods. A `pinnedRoom` variable, separate from
   `context.machineRoom`: `room.pin` sets it (reject with an error if `zone` isn't a real zone id
   in the current `zones` map — this is an explicit user action, not a tolerant background read);
@@ -106,6 +118,21 @@ state-owning daemon the other two files read from — the same shape `quickshell
   on success too, not just on the server's own broadcast — the socket is local, so there's no
   real latency cost, and it means the caller's own action reflects immediately without waiting
   on a round-trip push.
+- `readonly property string connectionStatus` — the actual context.set/pill dependency phase 1
+  never needed: `"not-set-up"` on exit 78, `"unreachable"` on exit 69, `"connecting"` while a
+  reconnect/spawn is scheduled or in flight, `"connected"` once the socket + handshake succeed.
+  `handleCoreExit` already branches on these exit codes but only sets internal booleans
+  (`coreFailed`, `suppressSpawn`) — this phase turns that existing branch into a value
+  `BarWidget.qml` can actually read, since `connected`/`handshakeOk` alone can't distinguish
+  "never connected because not set up" from "never connected because Homey's unreachable" from
+  "reconnecting right now" (all three present as `connected: false, handshakeOk: null`).
+- Context forwarding: read `Pipewire.defaultAudioSource`-based mic-in-use directly (mirroring
+  `Microphone.qml`'s `inUse`), the first-party idle/media services via
+  `PluginFirstPartyServiceApi.qml`, and `machineRoom` from this plugin's own setting
+  (`root.setting("machineRoom", null)`, no live signal). On any of the four changing, call
+  `context.set` through the request layer above — debounce with a short (e.g. 250ms) timer so a
+  burst of rapid signal changes (mic toggling, a track change) collapses into one call rather
+  than one per signal tick.
 - Exposed to `BarWidget.qml`/`Panel.qml` via `bar.shell.serviceFor("uchi")`, mirroring
   `quickshell.spotify`'s own pattern exactly — confirm the precise accessor name against that
   real file during implementation rather than guessing it here.
@@ -114,13 +141,16 @@ state-owning daemon the other two files read from — the same shape `quickshell
 
 Extends `BarWidget`. Manifest (below) gains the `bar-widget` kind and `entryPoints.barWidget`.
 
-- Renders the five pill states from the Context section above, derived from `uchi.connected`/
-  `handshakeOk` (already tracked) plus a `highestSeenRecentId` property (persisted only for the
-  session, not across restarts) compared against `uchi.state.recent[0].id` — "active" is
-  "connected and the newest Recent id is greater than the last-seen one."
+- Renders the five pill states directly from `uchi.connectionStatus` for the first four
+  (not-set-up/unreachable/connecting/connected-with-nothing-new); "active" is `connectionStatus
+  === "connected"` plus a `highestSeenTs` property (session-only, not persisted across restarts)
+  compared against `uchi.state.recent[0].ts` — **`ts`, not `id`**: `core/log.mjs` mints a
+  numeric id for capability rows but keeps Homey's own (non-numeric-guaranteed) id for
+  notification rows, so comparing ids across row kinds can compare a number against a string.
+  `ts` is a real number on every row regardless of kind, and `recent.list()` already sorts by it.
 - Click toggles the panel (confirm the real toggle call — `bar.shell`'s panel-open API — against
   `quickshell.spotify`'s `BarWidget.qml`/`omarchy.tailscale`'s `Panel.qml` during implementation).
-- On panel open, sets `highestSeenRecentId` to the current newest id, clearing "active" back to
+- On panel open, sets `highestSeenTs` to `uchi.state.recent[0].ts`, clearing "active" back to
   "idle".
 
 ### `Panel.qml` (repo root, new)
