@@ -14,23 +14,23 @@ function formatTransitionWhy(capabilityId, from, to) {
     case "onoff":
       return `→ ${to ? "on" : "off"}`;
     case "locked":
-      return to ? "locked" : "unlocked";
+      return `→ ${to ? "locked" : "unlocked"}`;
     case "dim":
-      return `dimmed to ${toDisplayPercent(capabilityId, to)}%`;
+      return `→ dimmed to ${toDisplayPercent(capabilityId, to)}%`;
     case "volume_set":
-      return `volume ${toDisplayPercent(capabilityId, to)}%`;
+      return `→ volume ${toDisplayPercent(capabilityId, to)}%`;
     case "target_temperature":
-      return `target ${to}°`;
+      return `→ target ${to}°`;
     case "speaker_playing":
-      return to ? "playing" : "stopped";
+      return `→ ${to ? "playing" : "stopped"}`;
     case "alarm_contact":
-      return "open";
+      return "→ open";
     case "alarm_motion":
-      return "motion";
+      return "→ motion";
     case "windowcoverings_state":
-      return String(to);
+      return `→ ${String(to)}`;
     default:
-      return String(to);
+      return `→ ${String(to)}`;
   }
 }
 
@@ -40,11 +40,14 @@ function capabilityRow(entry) {
 
   const row = {
     id: entry.id,
+    ts: entry.ts,
     kind: "capability",
     label: entry.deviceName,
     why,
     in: entry.cause === "prompt",
   };
+
+  if (entry.zoneName) row.zone = entry.zoneName;
 
   if (LINEABLE_CAPABILITIES.has(entry.capabilityId) && entry.from !== null && entry.from !== undefined) {
     row.line = lineFor(entry.deviceName, entry.capabilityId, entry.from);
@@ -54,7 +57,7 @@ function capabilityRow(entry) {
 }
 
 function notificationRow(entry) {
-  return { id: entry.id, kind: "notification", label: entry.ownerName, why: entry.excerpt, in: false };
+  return { id: entry.id, ts: entry.ts, kind: "notification", label: entry.ownerName, why: entry.excerpt, in: false };
 }
 
 // Derives Recent rows from log.mjs's buffer — takes both the entries and the

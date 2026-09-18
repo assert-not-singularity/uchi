@@ -12,8 +12,10 @@ import { EventEmitter } from "node:events";
 // PID-file-based guard was rejected instead.
 export function createRpcServer({ methods }) {
   const emitter = new EventEmitter();
+  const sockets = new Set();
 
   const server = net.createServer((socket) => {
+    sockets.add(socket);
     emitter.emit("connect");
 
     const rl = readline.createInterface({ input: socket });
@@ -46,12 +48,22 @@ export function createRpcServer({ methods }) {
       }
     });
 
-    rl.on("close", () => emitter.emit("disconnect"));
+    rl.on("close", () => {
+      sockets.delete(socket);
+      emitter.emit("disconnect");
+    });
     socket.on("error", () => {});
   });
 
   function writeLine(socket, obj) {
     socket.write(JSON.stringify(obj) + "\n");
+  }
+
+  // No queuing or delivery guarantee — a client mid-reconnect simply misses
+  // this and catches up on its next state.get, same tolerance the
+  // generation-guard in index.mjs's state.get already assumes.
+  function broadcast(payload) {
+    for (const socket of sockets) writeLine(socket, { event: "state.changed", ...payload });
   }
 
   function listen(socketPath) {
@@ -69,5 +81,5 @@ export function createRpcServer({ methods }) {
     server.close();
   }
 
-  return { listen, close, on: emitter.on.bind(emitter) };
+  return { listen, close, broadcast, on: emitter.on.bind(emitter) };
 }

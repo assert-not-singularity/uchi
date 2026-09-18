@@ -37,3 +37,41 @@ test("hello request/response round-trips over the socket, matching the request i
     fs.rmSync(socketPath, { force: true });
   }
 });
+
+test("broadcast() reaches every connected socket and not a disconnected one", async () => {
+  const socketPath = path.join(os.tmpdir(), `uchi-test-${process.pid}-${Date.now()}.sock`);
+  const rpc = createRpcServer({ methods: {} });
+
+  await rpc.listen(socketPath);
+  try {
+    async function connectClient() {
+      const socket = net.createConnection(socketPath);
+      await new Promise((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+      });
+      return { socket, rl: readline.createInterface({ input: socket }) };
+    }
+
+    const staying = await connectClient();
+    const leaving = await connectClient();
+
+    const nextPush = new Promise((resolve) => {
+      staying.rl.once("line", (line) => resolve(JSON.parse(line)));
+    });
+    leaving.rl.once("line", () => assert.fail("a disconnected socket must not receive a broadcast"));
+
+    leaving.socket.end();
+    await new Promise((resolve) => leaving.socket.once("close", resolve));
+
+    rpc.broadcast({ sections: ["recent"] });
+
+    const push = await nextPush;
+    assert.deepEqual(push, { event: "state.changed", sections: ["recent"] });
+
+    staying.socket.end();
+  } finally {
+    rpc.close();
+    fs.rmSync(socketPath, { force: true });
+  }
+});

@@ -10,6 +10,8 @@ import {
   subscribeToDiscreteChanges,
   setCapabilityValue,
   DISCRETE_CAPABILITIES,
+  GROUP_DRIVER_ID,
+  NUMERIC_TARGETS,
 } from "./homey.mjs";
 import { createRpcServer } from "./rpc.mjs";
 import * as log from "./log.mjs";
@@ -143,6 +145,21 @@ async function main() {
     return true;
   }
 
+  // A device that's a member of a Homey group has its own capability
+  // changes suppressed from Recent below — the group's own change already
+  // represents the action a person took; a separate row per member is
+  // noise. Scans `devices` fresh each call rather than caching a
+  // member→group map: group membership changes rarely and onChange doesn't
+  // fire often enough for an O(devices) scan to matter.
+  function groupIdForMember(deviceId) {
+    for (const candidate of Object.values(devices)) {
+      if (candidate.driverId === GROUP_DRIVER_ID && candidate.settings?.deviceIds?.includes(deviceId)) {
+        return candidate.id;
+      }
+    }
+    return null;
+  }
+
   function onChange({ deviceId, capabilityId, value }) {
     const key = keyFor(deviceId, capabilityId);
     const from = currentValue.get(key);
@@ -160,8 +177,11 @@ async function main() {
 
     if ((capabilityId === "alarm_contact" || capabilityId === "alarm_motion") && value !== true) return;
 
+    if (groupIdForMember(deviceId)) return;
+
     const deviceName = devices[deviceId]?.name ?? startupDeviceNames.get(deviceId);
-    log.append({ deviceId, deviceName, capabilityId, from, to: value, cause: null });
+    const zoneName = zones[devices[deviceId]?.zone]?.name;
+    if (log.append({ deviceId, deviceName, zoneName, capabilityId, from, to: value, cause: null })) notifyChanged();
   }
 
   subscribeToDiscreteChanges(devices, onChange);
@@ -182,16 +202,44 @@ async function main() {
     if (!pendingSelfWrites.has(key)) pendingSelfWrites.set(key, []);
     pendingSelfWrites.get(key).push(record);
 
+    // A numeric-target write above 0 can cascade an implicit onoff: true on
+    // the same device — pre-register that expected echo too, or it reads as
+    // an externally caused "on" and logs its own Recent row alongside the
+    // dim/volume/temperature row that already covers the same user action.
+    // Only when the device is actually off first: an already-on device's
+    // dim write triggers no cascade, and registering an echo nobody sends
+    // would sit in pendingSelfWrites for the full timeout, ready to
+    // misattribute an unrelated later onoff:true as this write's echo.
+    let onoffKey = null;
+    let onoffRecord = null;
+    if (NUMERIC_TARGETS.includes(capabilityId) && homeyValue > 0 && device.capabilitiesObj?.onoff?.setable) {
+      const onoffCacheKey = keyFor(device.id, "onoff");
+      const onoffCurrentValue = currentValue.has(onoffCacheKey)
+        ? currentValue.get(onoffCacheKey)
+        : device.capabilitiesObj?.onoff?.value;
+      if (onoffCurrentValue !== true) {
+        onoffKey = onoffCacheKey;
+        onoffRecord = { value: true, remaining: 2, timer: null };
+        onoffRecord.timer = setTimeout(() => evictRecord(onoffKey, onoffRecord), SELF_WRITE_ECHO_TIMEOUT_MS);
+        if (!pendingSelfWrites.has(onoffKey)) pendingSelfWrites.set(onoffKey, []);
+        pendingSelfWrites.get(onoffKey).push(onoffRecord);
+      }
+    }
+
     try {
       await setCapabilityValue(device, capabilityId, homeyValue);
     } catch (err) {
       clearTimeout(record.timer);
       evictRecord(key, record);
+      if (onoffRecord) {
+        clearTimeout(onoffRecord.timer);
+        evictRecord(onoffKey, onoffRecord);
+      }
       throw err;
     }
 
     currentValue.set(key, homeyValue);
-    return { deviceId: device.id, deviceName: device.name, capabilityId, from, to: homeyValue };
+    return { deviceId: device.id, deviceName: device.name, zoneName: zones[device.zone]?.name, capabilityId, from, to: homeyValue };
   }
 
   async function write(device, capabilityId, homeyValue) {
@@ -203,6 +251,20 @@ async function main() {
   }
 
   const context = { machineRoom: null, idle: null, mic: null, media: null };
+
+  // Separate from context.machineRoom: an explicit room.pin overrides it until
+  // room.unpin or the next room.pin, per design.md's Here section. Set only
+  // through room.pin below, never inferred.
+  let pinnedRoom = null;
+
+  // Set once rpc.listen() is reached (below); a capability change observed
+  // in the brief window before that can't have a client connected yet to
+  // push to anyway, so the `rpc` check here is just a null guard, not a
+  // real race condition.
+  let rpc = null;
+  function notifyChanged() {
+    if (rpc) rpc.broadcast({ sections: ["recent", "hero", "here"] });
+  }
 
   // Two counters, not one: startedGeneration marks every call that begins;
   // publishedGeneration tracks the highest generation that actually
@@ -259,14 +321,23 @@ async function main() {
       // variables — a superseded (losing) call still owes its own caller its
       // own fresh snapshot; only the shared state other handlers read from
       // is what a losing call must not overwrite.
-      const hereValue = here.compute(context.machineRoom, {
+      //
+      // Hero's room is always machineRoom — never the pin. Here follows the
+      // pin when one is active, falling back to the same computation as
+      // Hero's room otherwise (the two coincide exactly when nothing is
+      // pinned, per design.md's Here section — but pinning a different room
+      // must split them, which computing both from one shared call can't do).
+      const heroRoomValue = here.compute(context.machineRoom, {
         devices: freshDevices,
         zones: freshZones,
         moods: freshMoods,
       });
+      const hereValue = pinnedRoom
+        ? here.compute(pinnedRoom, { devices: freshDevices, zones: freshZones, moods: freshMoods })
+        : heroRoomValue;
 
       return {
-        hero: { room: hereValue, summary: heroSummary(freshDevices, freshUsers) },
+        hero: { room: heroRoomValue, summary: heroSummary(freshDevices, freshUsers) },
         recent: recent.list(log.tail(500), coreConfig.recentRows),
         attention: [],
         here: hereValue,
@@ -276,6 +347,26 @@ async function main() {
 
     "context.set": async (params) => {
       Object.assign(context, params);
+      return {};
+    },
+
+    "room.pin": async (params) => {
+      const zone = params.zone;
+      if (typeof zone !== "string" || !zones[zone]) {
+        throw new Error(`room.pin: unknown zone "${zone}"`);
+      }
+      if (pinnedRoom !== zone) {
+        pinnedRoom = zone;
+        notifyChanged();
+      }
+      return {};
+    },
+
+    "room.unpin": async () => {
+      if (pinnedRoom !== null) {
+        pinnedRoom = null;
+        notifyChanged();
+      }
       return {};
     },
 
@@ -296,14 +387,14 @@ async function main() {
     "prompt.run": async (params) => {
       const result = await run(params.line ?? "", { devices, zones, setCapabilityValue: write });
       if (result.ok) {
-        log.append({ ...result.change, cause: "prompt" });
+        if (log.append({ ...result.change, cause: "prompt" })) notifyChanged();
         return { ok: true };
       }
       return result;
     },
   };
 
-  const rpc = createRpcServer({ methods });
+  rpc = createRpcServer({ methods });
 
   // Stopped entirely while any client is connected, not merely reset per
   // connect — a fresh 60s countdown starts only at a genuine transition to
@@ -340,6 +431,7 @@ async function main() {
   function pollNotifications() {
     getNotifications(api)
       .then((entries) => {
+        let anyNew = false;
         if (!notificationsSeeded) {
           const seedIds = [];
           for (const entry of entries) {
@@ -347,14 +439,17 @@ async function main() {
             if (entryTime <= startupCutoff) {
               seedIds.push(entry.id);
             } else {
-              log.appendNotification(entry);
+              if (log.appendNotification(entry)) anyNew = true;
             }
           }
           log.seedNotificationIds(seedIds);
           notificationsSeeded = true;
         } else {
-          for (const entry of entries) log.appendNotification(entry);
+          for (const entry of entries) {
+            if (log.appendNotification(entry)) anyNew = true;
+          }
         }
+        if (anyNew) notifyChanged();
         setTimeout(pollNotifications, NOTIFICATION_POLL_MS);
       })
       .catch((err) => {

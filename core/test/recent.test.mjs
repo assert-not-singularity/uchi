@@ -21,7 +21,7 @@ test("a capability row renders why/line with dim percent-conversion, not raw 0-1
   const rows = list(entries, 20);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].label, "Desk Lamp");
-  assert.equal(rows[0].why, "dimmed to 40%");
+  assert.equal(rows[0].why, "→ dimmed to 40%");
   assert.equal(rows[0].line, "Desk Lamp 20");
   assert.equal(rows[0].in, false);
 });
