@@ -380,14 +380,23 @@ anticipated above:
   the Homey app setting both `onoff` and a numeric target on one device as two separate external
   capability changes, arriving close together in either order (observed both ways: onoff-then-dim
   turning a light on to a level, dim-then-onoff turning it off). Neither event is a self-write
-  echo, so `pendingSelfWrites` never sees either side. `onChange` now folds them for any device
-  that actually has a numeric target capability (a plain onoff-only device — a socket, a lock —
-  can't produce this pattern and logs immediately, unaffected): a numeric-target change records
-  `lastNumericChangeAt` and cancels any already-pending onoff row for that device; an `onoff`
-  change checks that timestamp (covers numeric-then-onoff) and, if nothing recent, holds for
-  `ONOFF_FOLD_WINDOW_MS` (500ms) before logging, canceled if a numeric-target change arrives in
-  that window (covers onoff-then-numeric). The 500ms figure is a guess wide enough to cover what
-  was actually observed, not confirmed against a flow's real timing.
+  echo, so `pendingSelfWrites` never sees either side. `onChange` now holds both in a per-device
+  `pendingDeviceChange` record (for any device that actually has a numeric target capability — a
+  plain onoff-only device, a socket or a lock, can't produce this pattern and logs immediately,
+  unaffected) and decides once things settle, by transition rather than arrival order: an `onoff`
+  change always wins over a coincident numeric-target one — the light turning on or off is what
+  happened, the specific level it landed on is incidental — and only a numeric-target change with
+  no accompanying `onoff` change logs its own level (already on, brightness adjusted). `onoff`
+  resolves within the short `ONOFF_FOLD_WINDOW_MS` (500ms); see the next entry for why a
+  numeric-target-only change waits longer.
+- **A smooth-transition ramp logged every intermediate step.** A scene/flow fading a light over a
+  few seconds sends several intermediate numeric-target values as separate external changes, each
+  logging its own row. `pendingDeviceChange`'s numeric-only path (see above) now debounces over
+  `DIM_TRANSITION_DEBOUNCE_MS` (5s, matching the existing `SELF_WRITE_ECHO_TIMEOUT_MS` — Recent
+  isn't the primary feedback loop, so a row landing a few seconds late costs nothing real),
+  reset on every new value so only the level it settles on after that long a quiet gap becomes a
+  row. The debounced record keeps the *first* value in the burst as `from` (not the second-to-last
+  step), since that's what the row's undo `line` targets.
 
 ## After this phase
 
