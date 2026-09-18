@@ -1,3 +1,7 @@
+This license applies to everything in this repository except `core/`, which is
+licensed separately under the GNU General Public License v3.0 — see
+`core/LICENSE`.
+
 MIT License
 
 Copyright (c) 2026 Niklas Puller
