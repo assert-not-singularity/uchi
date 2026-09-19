@@ -8,10 +8,16 @@ import {
 
 const VERB_WORDS = new Set(["on", "off", "lock", "unlock"]);
 
+// .trim() on both names: a real house has devices whose stored Homey name
+// carries a leading/trailing space (confirmed live — two of three otherwise
+// identically named "Deckenleuchte"s had one, the third didn't), which
+// broke exact-match ties between devices meant to be indistinguishable by
+// name alone — one would exact-match and "resolve" alone while its
+// identically-named siblings only matched as weaker substring hits.
 function things(devices, zones) {
   const result = [];
-  for (const d of Object.values(devices)) result.push({ kind: "device", id: d.id, name: d.name, zone: d.zone, ref: d });
-  for (const z of Object.values(zones)) result.push({ kind: "zone", id: z.id, name: z.name, ref: z });
+  for (const d of Object.values(devices)) result.push({ kind: "device", id: d.id, name: d.name.trim(), zone: d.zone, ref: d });
+  for (const z of Object.values(zones)) result.push({ kind: "zone", id: z.id, name: z.name.trim(), ref: z });
   return result;
 }
 
@@ -82,13 +88,23 @@ const MAX_AMBIGUOUS_MATCHES = 20;
 // `zone` is a separate field, not baked into `label` — a client renders it
 // as its own dimmed suffix the same way it does for a Recent row's zone,
 // rather than every row kind inventing its own "name (zone)" text.
-function ambiguous(matches, zones) {
-  return {
+//
+// `rest` (whatever of the input wasn't consumed reaching this ambiguous
+// set — a trailing word/value the tie swallowed, since none of these
+// things resolved far enough to apply it) is echoed back so a client can
+// pick one candidate and re-resolve "<label> <zone> <rest>" — the zone
+// qualifier is the only thing that can turn one of these into a fully
+// resolvable line, so the client reconstructs and re-runs one rather than
+// this function guessing which candidate was meant.
+function ambiguous(matches, zones, rest) {
+  const result = {
     matches: matches.slice(0, MAX_AMBIGUOUS_MATCHES).map((t) => {
       const zoneName = t.kind === "device" ? zones[t.zone]?.name : undefined;
       return zoneName ? { label: t.name, zone: zoneName, why: "ambiguous — pick one" } : { label: t.name, why: "ambiguous — pick one" };
     }),
   };
+  if (rest) result.rest = rest;
+  return result;
 }
 
 function deadEnd(label, why, zone) {
@@ -192,12 +208,21 @@ function resolveDevice(device, rest, zones) {
 // Flur among {Küche, Badezimmer, Flur, Schlafzimmer} even though "fl" is
 // also a substring of "Pflanzen", a zone none of these candidates are even
 // in and so isn't a real competing interpretation. Only if that first pass
-// doesn't narrow to one does it check the whole house's zones — solely to
-// return a clean "no match there" when the trailing text names a real zone
-// that just isn't one of the candidates', rather than silently falling
-// through to the unqualified ambiguous list.
+// doesn't narrow to one does it check the whole house's zones for a clean
+// "no match there" when the trailing text names a real zone that just
+// isn't one of the candidates'.
+//
+// A leading recognized word (on/off/lock/unlock) skips zone-narrowing
+// entirely, checked before either zone pass — confirmed live that "decke
+// on" (a plain verb, not a zone guess at all) fuzzy-substring-matches
+// "Nutzerkonten" ("Nutzer**kon**ten"), hijacking the whole ambiguous list
+// into one bogus "no match in Nutzerkonten" row. Once the leftover text is
+// a known word, it's never a zone guess, so there's no reason to try
+// matching it as one at all — simpler and more direct than narrowing what
+// counts as a zone match to dodge the collision.
 function narrowByZone(candidates, restTokens, zones) {
   if (restTokens.length === 0) return null;
+  if (VERB_WORDS.has(restTokens[0].toLowerCase())) return null;
 
   const toZoneThings = (list) => list.map((z) => ({ kind: "zone", id: z.id, name: z.name }));
 
@@ -209,7 +234,7 @@ function narrowByZone(candidates, restTokens, zones) {
     const zone = relevantMatch.matches[0];
     const narrowed = candidates.filter((t) => t.zone === zone.id);
     const afterZone = restTokens.slice(relevantMatch.consumed).join(" ").trim();
-    if (narrowed.length > 1) return ambiguous(narrowed, zones);
+    if (narrowed.length > 1) return ambiguous(narrowed, zones, afterZone);
     return resolveDevice(narrowed[0].ref, afterZone, zones);
   }
 
@@ -242,7 +267,7 @@ export function resolve(text, { devices, zones }) {
       const narrowed = narrowByZone(matched.matches, rest, zones);
       if (narrowed) return narrowed;
     }
-    return ambiguous(matched.matches, zones);
+    return ambiguous(matched.matches, zones, rest.join(" ").trim());
   }
 
   const thing = matched.matches[0];
