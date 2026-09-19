@@ -121,15 +121,17 @@ Panel {
     return String(text ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
-  // Rich-text markup, not a plain string: Recent spans multiple rooms at
-  // once (unlike Hero/Here, already grouped under a room's own section
-  // header), so its rows get a dimmed "(zone)" suffix the other kinds don't.
+  // Rich-text markup, not a plain string: any row carrying a `.zone` field
+  // (Recent, an ambiguous match, a dead end) gets the same dimmed suffix —
+  // one style for every kind, not a per-kind rule. Hero/Here rows never
+  // carry `.zone` (they're already grouped under a room's own section
+  // header, so it'd be redundant), so this never fires for them.
   function rowMarkup(entry) {
     if (entry.kind === "room") return escapeMarkup(entry.room.name)
     var row = entry.row
     if (!row) return ""
     var text = escapeMarkup(row.label)
-    if (entry.kind === "recent" && row.zone) {
+    if (row.zone) {
       text += " <font color=\"" + Color.muted + "\">" + escapeMarkup(row.zone) + "</font>"
     }
     // A transition's own "→ ..." already reads as a separator — stacking

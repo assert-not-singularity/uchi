@@ -397,6 +397,32 @@ anticipated above:
   reset on every new value so only the level it settles on after that long a quiet gap becomes a
   row. The debounced record keeps the *first* value in the burst as `from` (not the second-to-last
   step), since that's what the row's undo `line` targets.
+- **Zone-qualified device disambiguation, previously flagged as out of scope, is now built.** The
+  grammar had no way to reach one specific device when several share the exact same literal Homey
+  name — a real, common naming pattern (this house has three devices literally named
+  "Deckenleuchte", across Küche/Badezimmer/Flur), not a hypothetical, and one no amount of typing
+  more of the name could ever resolve. `grammar.mjs`'s `resolve()` now tries a trailing zone name
+  against an ambiguous device set's own zones — `resolveDevice()` is split out of `resolve()` so
+  both the ordinary single-match path and this new `narrowByZone()` path reach the same word/value
+  logic. Matched only against the zones the ambiguous candidates actually span, not every zone in
+  the house: confirmed live that "decken fl" must narrow to Flur among {Küche, Badezimmer, Flur,
+  Schlafzimmer} even though "fl" is also a substring of "Pflanzen," a zone none of these candidates
+  are even in and so was never a real competing interpretation. Falls back to checking the whole
+  house's zones only to return a clean "no match there" when the trailing text names a real zone
+  that just isn't one of the candidates', rather than silently doing nothing; falls back further to
+  the plain unqualified ambiguous list when the trailing text isn't a zone at all. Word/value
+  semantics never apply to a still-ambiguous set in the existing grammar, so there's no case where
+  the trailing text could mean something *other* than a zone qualifier once ambiguous — no new
+  parse conflict to resolve. Order is device-then-zone only; no reverse form.
+- **A match's zone was baked into `label` as plain "(Zone)" text, inconsistent with Recent's own
+  dimmed zone suffix — and a resolved single device's dead end dropped the zone entirely, right
+  when it stopped needing to distinguish anything.** `qualifyLabel` (now removed) built the label
+  string itself; `ambiguous()` returns a separate `zone` field instead — the same field shape
+  Recent rows already carry — and `deadEnd()` takes an optional `zone` argument, which
+  `resolveDevice()` now always passes (the device's own zone, looked up via the `zones` parameter
+  it gained). `Panel.qml`'s `rowMarkup()` renders the dimmed suffix for *any* row carrying `.zone`,
+  not `entry.kind === "recent"` specifically — one style for every row kind, not a per-kind rule
+  (Hero/Here rows never carry `.zone` at all, so this never fires for them, unaffected).
 
 ## After this phase
 
