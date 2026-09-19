@@ -438,7 +438,7 @@ async function main() {
     },
 
     "prompt.resolve": async (params) => {
-      const result = resolve(params.text ?? "", { devices, zones });
+      const result = resolve(params.text ?? "", { devices, zones, notches: coreConfig.notches });
 
       if (result.room) return { matches: [], room: result.room };
 
@@ -452,7 +452,7 @@ async function main() {
     },
 
     "prompt.run": async (params) => {
-      const result = await run(params.line ?? "", { devices, zones, setCapabilityValue: write });
+      const result = await run(params.line ?? "", { devices, zones, setCapabilityValue: write, notches: coreConfig.notches });
       if (result.ok) {
         if (log.append({ ...result.change, cause: "prompt" })) notifyChanged();
         return { ok: true };

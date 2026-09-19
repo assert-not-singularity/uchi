@@ -11,6 +11,76 @@ test('"desk 40" resolves to the Desk Lamp\'s dim capability, percent-converted',
   });
 });
 
+// Desk Lamp's fixture default is dim: 0.6 (60%).
+test('"desk +10" steps up from the current level, not an absolute 10%', () => {
+  const result = resolve("desk +10", { devices, zones });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-desk-lamp", capabilityId: "dim", value: 0.7 },
+  });
+});
+
+test('"desk -10" steps down from the current level', () => {
+  const result = resolve("desk -10", { devices, zones });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-desk-lamp", capabilityId: "dim", value: 0.5 },
+  });
+});
+
+test('a step outside the capability\'s range is a dead end, not clamped', () => {
+  const result = resolve("desk +50", { devices, zones });
+  assert.equal(result.action, undefined);
+  assert.equal(result.matches[0].why, "needs 0–100");
+});
+
+test('"desk *2" doubles the current level and clamps at the capability\'s max', () => {
+  // 60% * 2 = 120%, clamped to 100 — design.md: scale "clamps at 0/100".
+  const result = resolve("desk *2", { devices, zones });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-desk-lamp", capabilityId: "dim", value: 1 },
+  });
+});
+
+test('"desk /2" halves the current level', () => {
+  const result = resolve("desk /2", { devices, zones });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-desk-lamp", capabilityId: "dim", value: 0.3 },
+  });
+});
+
+test("scale is levels-only — a thermostat has no reading to scale", () => {
+  const result = resolve("bedroom thermostat *2", { devices, zones });
+  assert.equal(result.action, undefined);
+  assert.equal(result.matches[0].why, "needs a word");
+});
+
+test('"desk ++" steps up by the configured light notch, clamping rather than dead-ending', () => {
+  const result = resolve("desk ++", { devices, zones, notches: { light: 10, vol: 5, temp: 1 } });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-desk-lamp", capabilityId: "dim", value: 0.7 },
+  });
+});
+
+test('"desk --" steps down by the configured light notch', () => {
+  const result = resolve("desk --", { devices, zones, notches: { light: 10, vol: 5, temp: 1 } });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-desk-lamp", capabilityId: "dim", value: 0.5 },
+  });
+});
+
+test('a notch with no configured step for its kind falls back to 1, still clamping', () => {
+  const result = resolve("desk ++", { devices, zones, notches: {} });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-desk-lamp", capabilityId: "dim", value: 0.61 },
+  });
+});
+
 test("a value outside a capability's min/max is a dead end, not a clamped write", () => {
   const result = resolve("bedroom thermostat 40", { devices, zones });
   assert.equal(result.action, undefined);
