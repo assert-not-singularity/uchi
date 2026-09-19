@@ -423,6 +423,31 @@ anticipated above:
   it gained). `Panel.qml`'s `rowMarkup()` renders the dimmed suffix for *any* row carrying `.zone`,
   not `entry.kind === "recent"` specifically — one style for every row kind, not a per-kind rule
   (Hero/Here rows never carry `.zone` at all, so this never fires for them, unaffected).
+- **An ambiguous candidate had no `line`, so selecting one via arrow keys + Enter did nothing at
+  all.** This was never actually working, not a regression from removing `Tab` — an ambiguous row
+  never carried a `line` in the first place, since there's no single valid grammar line for "the
+  ambiguous set." `ambiguous()` now also echoes back `rest` — whatever of the input the tie
+  couldn't apply (a trailing word/value) — so `Panel.qml`'s `activateCursor()` can reconstruct
+  `"<label> <zone> <rest>"` for the selected candidate and run that, reusing the same
+  zone-qualification this phase already added rather than inventing a bypass around `prompt.run`.
+  A candidate with no zone (the rare zone-vs-device name tie) can't be qualified this way and
+  stays inert, same as before.
+- **Two further zone-narrowing bugs, found only by testing the reconstructed-line path against a
+  real house:** (1) Homey's own stored device names aren't consistently trimmed — two of three
+  otherwise identically named "Deckenleuchte"s had a trailing space, one didn't, so typing the
+  name exactly resolved to the space-free one *alone* instead of tying all three, silently
+  skipping zone-narrowing altogether. `things()` now trims both device and zone names once, the
+  single place everything else in this file derives `name` from. (2) A leftover word (`on`, `off`)
+  could coincidentally substring-match an unrelated real zone (`"on"` inside `"Nutzerkonten"`),
+  hijacking an entire ambiguous list into one bogus "no match in Nutzerkonten" row — fixed by
+  having `narrowByZone` skip zone-narrowing entirely whenever the leftover text starts with a
+  recognized verb word, rather than narrowing what counts as a zone match to dodge the collision.
+- **The bar pill read "active" after an action taken while the panel was already open.**
+  `BarWidget.qml`'s "seen" watermark only updated at the moment the panel opened
+  (`onOpenedChanged`), not while it stayed open — so a Recent row produced by the person's own
+  action, while they were looking straight at the panel, still counted as "unseen since last
+  open" until they closed and reopened it. `onNewestRecentTsChanged` now updates the watermark too,
+  whenever the panel is currently open, not just at the instant it opens.
 
 ## After this phase
 

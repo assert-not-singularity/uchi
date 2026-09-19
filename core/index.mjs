@@ -448,7 +448,7 @@ async function main() {
         return { matches: [{ label, line: params.text, why }] };
       }
 
-      return { matches: result.matches };
+      return result.rest ? { matches: result.matches, rest: result.rest } : { matches: result.matches };
     },
 
     "prompt.run": async (params) => {

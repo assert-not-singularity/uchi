@@ -62,6 +62,53 @@ test("two devices sharing an exact name resolve as ambiguous, zone-qualified can
   assert.deepEqual(resultZones, ["Living Room", "Office"]);
 });
 
+test("a trailing value that doesn't narrow by zone is echoed back as rest, not dropped", () => {
+  // "20" is neither zone nor consumed by either candidate — a client needs
+  // it back to reconstruct "<label> <zone> <rest>" once a person picks one
+  // of the ambiguous candidates, since neither this function nor the RPC
+  // layer can guess which one was meant.
+  const result = resolve("reading lamp 20", { devices, zones });
+  assert.equal(result.matches.length, 2);
+  assert.equal(result.rest, "20");
+});
+
+test("a leading verb word skips zone-narrowing even if it substring-matches an unrelated zone", () => {
+  // "on" is a substring of "Salon" — confirmed live against a real house
+  // that this exact kind of coincidence ("on" inside "Nutzerkonten")
+  // hijacked an ambiguous list into a bogus "no match in <unrelated zone>"
+  // dead end. A local zone, not a fixture.mjs change, since neither
+  // Reading Lamp zone needs to be involved for this collision to matter.
+  const zonesWithCollision = { ...zones, "zone-salon": { id: "zone-salon", name: "Salon", parent: null } };
+  const result = resolve("reading lamp on", { devices, zones: zonesWithCollision });
+  assert.equal(result.matches.length, 2);
+  assert.ok(result.matches.every((m) => m.label === "Reading Lamp"));
+});
+
+// A local copy, not a change to fixture.mjs's shared devices — a trailing
+// space on just one of two otherwise identically named devices, confirmed
+// live against a real house (two of three "Deckenleuchte"s had one, the
+// third didn't), broke their exact-match tie: the space-free one would
+// resolve alone instead of tying with its "identically" named sibling.
+const paddedNameDevices = {
+  ...devices,
+  "office-reading-lamp": { ...devices["office-reading-lamp"], name: "Reading Lamp " },
+};
+
+test("a trailing space on only one of two identically named devices doesn't break their tie", () => {
+  const result = resolve("reading lamp", { devices: paddedNameDevices, zones });
+  assert.equal(result.matches.length, 2);
+  const resultZones = result.matches.map((m) => m.zone).sort();
+  assert.deepEqual(resultZones, ["Living Room", "Office"]);
+});
+
+test("zone-narrowing still resolves the padded-name candidate correctly", () => {
+  const result = resolve("reading lamp office 40", { devices: paddedNameDevices, zones });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-reading-lamp", capabilityId: "dim", value: 0.4 },
+  });
+});
+
 test("a trailing zone name narrows an ambiguous exact-name match to one device", () => {
   const result = resolve("reading lamp office 40", { devices, zones });
   assert.deepEqual(result, {
