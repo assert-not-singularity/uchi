@@ -51,6 +51,14 @@ test('"desk /2" halves the current level', () => {
   });
 });
 
+test('"desk /0" is rejected, not a silent write to the capability\'s maximum', () => {
+  // 60 / 0 = Infinity, which the clamp would otherwise silently turn into
+  // a write at the capability's max — confirmed live before this fix.
+  const result = resolve("desk /0", { devices, zones });
+  assert.equal(result.action, undefined);
+  assert.equal(result.matches[0].why, "needs a number");
+});
+
 test("scale is levels-only — a thermostat has no reading to scale", () => {
   const result = resolve("bedroom thermostat *2", { devices, zones });
   assert.equal(result.action, undefined);

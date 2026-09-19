@@ -463,6 +463,15 @@ anticipated above:
   the value grammar only — the `h`/`l` keyboard shortcut that would trigger a notch without typing
   stays unbound, per this phase's separate decision to remove every shortcut beyond
   typing/navigation/Enter.
+- **Two Copilot-review findings on the value grammar and onoff/numeric fold, both real.** `/0`
+  matched the scale form (`\d+` accepts a lone `0`) and divided to `Infinity`, which the clamp then
+  silently turned into a write at the capability's maximum — `parseValue()` now rejects a zero
+  divisor outright rather than letting the clamp mask it. Separately, `onChange`'s onoff+numeric
+  fold unconditionally overwrote `pending.onoffChange` on every `onoff` event, so a device flipped
+  on/off/on in quick succession (no numeric event involved at all) silently lost every transition
+  but the last — the pending fold is meant for one onoff+numeric *pair*, not for coalescing
+  independent toggles. A second `onoff` event now flushes whatever was already pending as its own
+  Recent row before starting a fresh pending record, so distinct toggles are never dropped.
 
 ## After this phase
 

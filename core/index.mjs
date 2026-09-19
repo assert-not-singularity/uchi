@@ -234,6 +234,12 @@ async function main() {
       const pending = pendingDeviceChange.get(deviceId) ?? { onoffChange: null, numericChange: null, timer: null };
       pendingDeviceChange.set(deviceId, pending);
       if (capabilityId === "onoff") {
+        // A second onoff transition arriving before the first was decided
+        // is an independent toggle, not a pair to fold with a numeric
+        // change — flush the first now rather than losing it to this
+        // overwrite (this device could otherwise be flipped on/off/on in
+        // quick succession and only the last transition would ever log).
+        if (pending.onoffChange) logCapabilityChange({ deviceId, ...pending.onoffChange });
         pending.onoffChange = { capabilityId, from, to: value };
       } else {
         // Preserves the ramp's true starting value, not just its

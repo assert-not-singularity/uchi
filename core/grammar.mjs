@@ -21,7 +21,14 @@ const CAPABILITY_KIND = { dim: "light", volume_set: "vol", target_temperature: "
 // a negative absolute value at all.
 function parseValue(rest) {
   if (/^[+-]\d+(\.\d+)?$/.test(rest)) return { kind: "step", amount: Number(rest) };
-  if (/^[*/]\d+(\.\d+)?$/.test(rest)) return { kind: "scale", op: rest[0], factor: Number(rest.slice(1)) };
+  if (/^[*/]\d+(\.\d+)?$/.test(rest)) {
+    const factor = Number(rest.slice(1));
+    // "/0" divides to Infinity, which the clamp below would silently turn
+    // into a write at the capability's maximum — reject it as an invalid
+    // value instead of quietly changing the device to 100%.
+    if (rest[0] === "/" && factor === 0) return null;
+    return { kind: "scale", op: rest[0], factor };
+  }
   if (rest === "++") return { kind: "notch", direction: 1 };
   if (rest === "--") return { kind: "notch", direction: -1 };
   const amount = Number(rest);
