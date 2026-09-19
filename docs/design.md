@@ -138,6 +138,14 @@ Sign disambiguation: a sign before digits is a step (`+10`); before a name it's 
 exclusion (`-kitchen`) or (as `+`) a join (`kitchen+office`); alone, doubled, it's a
 notch (`kitchen++`).
 
+Several devices can share the exact same literal Homey name (a common naming
+pattern, not a hypothetical — many houses have more than one "Ceiling Light").
+When that produces an ambiguous match, a trailing zone name narrows it to one
+device (`ceiling light kitchen`), checked only against the zones the ambiguous
+candidates actually span — an unrelated zone whose name happens to contain the
+same letters never competes. This is device-then-zone order only; there's no
+reverse form.
+
 A token that names a kind (`son`, `light`, `temp`) is parsed as the `thing`, not
 the `word`, whenever it appears in thing position — so `temp -bedroom 20` reads
 as the kind *every thermostat*, excluding the Bedroom's, with no separate `word`
@@ -204,7 +212,12 @@ since no such wrapper exists yet to design it against.
   `line`. Discrete = onoff, dim, locked, contact/motion going true, playing state,
   targets, moods, flows, presence, notifications. Explicitly **excludes** every
   `measure_*`/`meter_*` continuous reading. Changes within 2s of a mood/flow fold
-  under it.
+  under it. A Homey Group's member-device changes fold into the group's own row,
+  not one row per member; a device's coincident `onoff` + numeric-target change
+  folds into one row (the `onoff` transition's wording wins over the specific
+  level reached); a numeric-target-only change (a scene's smooth transition, say)
+  debounces so its intermediate steps settle into one row rather than logging
+  each step.
 - **Attention** — alarms (active, pinned) → faults (unreachable > 1h, battery < 15%,
   snoozable) → anomalies (> 3 spreads from the hourly baseline, baseline shown) →
   open loops (something on far longer than its own history, with an off `line`).
@@ -228,26 +241,20 @@ since no such wrapper exists yet to design it against.
 
 ## Keyboard (interactive wrappers)
 
-Lazy by design — few keys, each reused across contexts rather than a separate
-key per section:
+Typing, `↑`/`↓` (or `j`/`k`) to move the cursor over a `prompt.resolve`
+candidate list, `Enter` to run the highlighted candidate's `line` through
+`prompt.run`, and `Esc`/`Backspace` to clear the prompt or close the panel.
+That's the complete set.
 
-- `j`/`k` or `↑`/`↓` — move the cursor, whether over a `prompt.resolve`
-  candidate list or over the resting body's Recent/Attention/Here/Habits rows.
-- `Enter` — run the highlighted row's `line`, sent through `prompt.run` like
-  typed input. The one exception is a bare zone-query row (see the `office`
-  example below): it has no device grammar line, and `Enter` instead calls
-  `room.pin` directly with that zone.
-- `Tab` — copy the highlighted row's `line` into the prompt, to edit before
-  running rather than running it as-is.
-- `Shift+Tab` — switch to the neighbouring bar panel.
-- `h`/`l` — step the highlighted row's thing `--`/`++` (one notch) without
-  leaving the row.
-- `x` — make the highlighted row go away: `row.dismiss` on an Attention row,
-  `row.mute` on a Habits row. Same key, same intent, different method — which
-  one fires depends on which section the cursor is in.
-- `s` — snooze the highlighted Attention row (`row.snooze`, 30 days).
-- `a` — all off, the hero's trailing control.
-- `Esc` — clear the prompt if it holds text, otherwise close the panel.
+Every other key this section once specified — `Tab`, `Shift+Tab`, `h`/`l`
+(notch step), `x` (dismiss/mute), `s` (snooze), and `a` (all off) — is
+deliberately absent, not just unbound. A capability like `onoff` can't tell a
+light from a socket keeping other equipment powered, so a hotkey that acts on
+"whatever's under the cursor" or "everything in this room" with no per-device
+judgment is unsafe by construction; see "Explicitly decided against" below.
+`row.dismiss`/`row.snooze`/`row.mute` still exist as RPC methods (Attention/
+Habits rows can propose them once phase 4/5 build the sections that need
+them) — only the blind keyboard shortcuts for them are rejected.
 
 A one-shot caller (`bin/uchi`) has none of this — see `prompt.resolve` above
 for how it handles the same ambiguity without an interactive loop to navigate.
@@ -394,3 +401,9 @@ payoff of the core/wrapper split.
 - Inferring Here from recent signals ("who's in which room") on a desktop —
   it's a fixed config value; the ladder-based inference only matters for a
   hypothetical laptop wrapper, deferred.
+- A blind "all off" keyboard shortcut — a device's `onoff` capability can't
+  distinguish a light from a socket keeping other equipment powered, and an
+  ambient scan of "whatever's in this room" makes no per-device judgment at
+  all. Any future bulk action needs an explicitly typed grammar `kind`
+  (`light`/`son`/`temp`) and its own decision about which capabilities are
+  safe to include — never a keyboard shortcut with no thing named.

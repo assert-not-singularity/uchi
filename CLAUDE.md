@@ -17,10 +17,33 @@ needs it and cannot derive it from the code or the docs.
 - Full design (architecture, protocol, prompt grammar, panel sections, build phases,
   and *why* each decision was made) → `docs/design.md` — read this before any
   architectural change, not just the code.
-- Repo overview / current code layout → `README.md` (not written yet; the repo is
-  pre-code — see `docs/design.md`'s "Repo layout (target)" for the intended shape)
+- Repo overview, current build status, and dev/test workflow → `README.md`.
 - Domain terms (thing/word/value/line, Recent/Attention/Here/Habits, "the core" vs
   "a wrapper") are all defined in `docs/design.md` — do not guess at them.
+
+## Repo layout
+
+```
+uchi/
+  manifest.json     # Omarchy plugin manifest
+  Service.qml       # spawn-or-connect to the core, context.set, IPC target "uchi"
+  BarWidget.qml      # the bar pill; also loads Panel.qml internally (no manifest entry of its own)
+  Panel.qml         # prompt + Recent + Here, keyboard
+  core/
+    index.mjs        # entry: settings, connect to Homey, start rpc.mjs
+    rpc.mjs           # socket server + JSON-RPC-styled dispatch/framing
+    homey.mjs         # homey-api: events in, verbs out
+    config.mjs        # credentials file (uchi setup) + shared core config
+    validate.mjs      # one-shot address+token check, used by `uchi setup`
+    log.mjs recent.mjs here.mjs   # append-only log, Recent, Here
+    grammar.mjs       # exact/fuzzy/thing-word-value parser
+    test/             # node --test, against a fixture house (never real household data)
+  bin/uchi           # CLI: thin client on the same socket
+  docs/design.md     # architecture, protocol, grammar, build order
+```
+
+`attention.mjs`, `habits.mjs`, and `model.mjs` don't exist yet — phases 4/5 of
+`docs/design.md`'s build order, not started.
 
 ## Project-specific facts
 
