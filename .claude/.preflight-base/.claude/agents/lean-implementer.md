@@ -1,7 +1,7 @@
 ---
 name: lean-implementer
 description: >
-  Lean code-writing agent for a single, well-scoped implementation task. Edits code, runs the
+  Focused, narrowly-scoped code-writing agent for a single implementation task. Edits code, runs the
   test suite, reports. Its tool set is deliberately minimal: every MCP tool schema a subagent
   loads is paid for as a cache WRITE on first use (~12.5x read price), so the tens of thousands
   of tokens of Slack / Jira / cloud / browser schemas a file-editing agent never calls are pure
