@@ -27,3 +27,10 @@ test("a device with both onoff (on) and dim renders why/line from dim, not onoff
   assert.equal(floorLamp.why, "60%");
   assert.equal(floorLamp.line, "Floor Lamp 60");
 });
+
+test("a row carries its raw value and Homey device class, for rendering (not grammar)", () => {
+  const result = compute("zone-living", { devices, zones, moods });
+  const floorLamp = result.devices.find((d) => d.label === "Floor Lamp");
+  assert.equal(floorLamp.value, 0.6);
+  assert.equal(floorLamp.deviceClass, "light");
+});

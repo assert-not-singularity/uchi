@@ -73,9 +73,28 @@ Panel {
     }
     var rows = []
     for (var h = 0; h < root.heroDevices.length; h++) rows.push({ kind: "hero", row: root.heroDevices[h] })
-    for (var r = 0; r < root.recentRows.length; r++) rows.push({ kind: "recent", row: root.recentRows[r] })
+    for (var r = 0; r < root.recentRows.length; r++) {
+      rows.push({ kind: "recent", row: root.recentRows[r], tsRole: root.tsRoleAt(root.recentRows, r) })
+    }
     for (var k = 0; k < root.hereDevices.length; k++) rows.push({ kind: "here", row: root.hereDevices[k] })
     return rows
+  }
+
+  // Recent is newest-first and already ts-sorted by the core — a run of
+  // consecutive rows landing in the same displayed minute came from one
+  // linked event (a flow/group setting several devices at once with no
+  // mood/flow row of its own to fold under), and the timeline gutter draws
+  // them as a bracket instead of repeating the same time on every line.
+  // Grouped by the displayed minute, not raw ts equality: separate devices
+  // reacting to one trigger arrive as separate events a few hundred ms to a
+  // couple seconds apart, essentially never at the exact same millisecond.
+  function tsRoleAt(rows, i) {
+    var sameAsPrev = i > 0 && root.formatTime(rows[i - 1].ts) === root.formatTime(rows[i].ts)
+    var sameAsNext = i < rows.length - 1 && root.formatTime(rows[i + 1].ts) === root.formatTime(rows[i].ts)
+    if (!sameAsPrev && !sameAsNext) return "single"
+    if (!sameAsPrev && sameAsNext) return "first"
+    if (sameAsPrev && sameAsNext) return "middle"
+    return "last"
   }
 
   property int cursorIndex: 0
@@ -142,6 +161,83 @@ Panel {
     return String(text ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
+  // Homey's device.class -> a Nerd Font glyph (the shell's default font is
+  // "JetBrainsMono Nerd Font" — see Style.qml), for a quick visual cue next
+  // to a row's name. capabilityId alone can't tell a light from a socket,
+  // both commonly controlled via plain onoff — this is why here.mjs/
+  // recent.mjs thread the device's own class through instead. Only classes
+  // picked confidently; anything else falls back to a plain dot rather than
+  // guess at a glyph that might not exist in every Nerd Font build.
+  function classIcon(deviceClass) {
+    switch (deviceClass) {
+      case "light": return ""      // lightbulb-o
+      case "socket": return ""     // plug
+      case "thermostat": return "" // thermometer-half
+      case "lock": return ""       // lock
+      case "speaker": return ""    // volume-up
+      case "tv": return ""         // television
+      default: return "●"
+    }
+  }
+
+  function rowIcon(entry) {
+    var row = entry.row
+    if (!row) return ""
+    if (entry.kind === "recent" && row.kind === "notification") return "" // bell
+    if (entry.kind === "hero" || entry.kind === "here" || entry.kind === "recent") {
+      return classIcon(row.deviceClass)
+    }
+    // A "match" row can be a device or a zone candidate — both can share
+    // the exact same name at once (a zone and a device both "Wohnzimmer"),
+    // which is exactly the case an icon needs to disambiguate at a glance.
+    if (entry.kind === "match") {
+      return row.kind === "zone" ? "" /* home */ : classIcon(row.deviceClass)
+    }
+    return ""
+  }
+
+  // A device currently off reads as background, not foreground — matches
+  // the mockup's dimmed "off" rows. Scoped to Hero/Here only: a Recent row
+  // is a transition that already happened, not a persisted state, so
+  // dimming a "→ off" row the moment it lands would read as a rendering
+  // glitch, not a status.
+  function rowOpacity(entry) {
+    var row = entry.row
+    if (!row) return 1
+    if (entry.kind !== "hero" && entry.kind !== "here") return 1
+    return row.capabilityId === "onoff" && row.value === false ? 0.55 : 1
+  }
+
+  // Includes seconds, not just HH:MM — tsRoleAt groups by this same string,
+  // and a coarser minute-level grouping would bracket unrelated rows that
+  // simply landed in the same minute. Same-second is still loose enough to
+  // catch a real linked event (a flow/group action's separate device writes
+  // land within the same second in practice), but tight enough that two
+  // unrelated actions essentially never collide.
+  function formatTime(ts) {
+    var d = new Date(ts)
+    var hh = String(d.getHours()).padStart(2, "0")
+    var mm = String(d.getMinutes()).padStart(2, "0")
+    var ss = String(d.getSeconds()).padStart(2, "0")
+    return hh + ":" + mm + ":" + ss
+  }
+
+  // The timeline gutter rendered before a Recent row: a faded time plus a
+  // dash for a standalone row, or a box-drawing bracket for a run of rows
+  // that shares one ts (see tsRoleAt) — the time then prints once, on the
+  // bracket's first line, instead of repeating.
+  function timeGutter(entry) {
+    if (entry.kind !== "recent") return ""
+    var row = entry.row
+    var showTime = entry.tsRole === "single" || entry.tsRole === "first"
+    var time = showTime ? formatTime(row.ts) : "        "
+    var connector = entry.tsRole === "single" ? "--"
+      : entry.tsRole === "first" ? "┌─"
+      : entry.tsRole === "middle" ? "├─"
+      : "└─"
+    return time + " " + connector + " "
+  }
+
   // Rich-text markup, not a plain string: any row carrying a `.zone` field
   // (Recent, an ambiguous match, a dead end) gets the same dimmed suffix —
   // one style for every kind, not a per-kind rule. Hero/Here rows never
@@ -151,7 +247,8 @@ Panel {
     if (entry.kind === "room") return escapeMarkup(entry.room.name)
     var row = entry.row
     if (!row) return ""
-    var text = escapeMarkup(row.label)
+    var icon = rowIcon(entry)
+    var text = icon ? escapeMarkup(icon) + " " + escapeMarkup(row.label) : escapeMarkup(row.label)
     if (row.zone) {
       text += " <font color=\"" + Color.muted + "\">" + escapeMarkup(row.zone) + "</font>"
     }
@@ -250,9 +347,11 @@ Panel {
               required property int index
               width: bodyColumn.width
 
+              readonly property bool isFirstOfKind: rowDelegate.index === 0
+                || root.activeRows[rowDelegate.index - 1].kind !== rowDelegate.modelData.kind
+
               Text {
-                visible: rowDelegate.index === 0
-                  || root.activeRows[rowDelegate.index - 1].kind !== rowDelegate.modelData.kind
+                visible: rowDelegate.isFirstOfKind
                 width: rowDelegate.width
                 text: root.sectionTitle(rowDelegate.modelData.kind)
                 color: Color.muted
@@ -261,14 +360,59 @@ Panel {
                 font.bold: true
               }
 
+              // Mood chips: informational only for now — the grammar has no
+              // way to activate a mood yet, so these aren't clickable.
+              Flow {
+                visible: rowDelegate.modelData.kind === "here" && rowDelegate.isFirstOfKind
+                  && root.hereRoom && root.hereRoom.moods && root.hereRoom.moods.length > 0
+                width: rowDelegate.width
+                spacing: Style.space(4)
+
+                Repeater {
+                  model: root.hereRoom ? root.hereRoom.moods : []
+
+                  Rectangle {
+                    required property var modelData
+                    radius: Style.space(2)
+                    color: "transparent"
+                    border.color: Color.muted
+                    border.width: 1
+                    width: chipText.implicitWidth + Style.space(12)
+                    height: chipText.implicitHeight + Style.space(6)
+
+                    Text {
+                      id: chipText
+                      anchors.centerIn: parent
+                      text: modelData.name
+                      color: Color.foreground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.body
+                    }
+                  }
+                }
+              }
+
               Rectangle {
                 width: rowDelegate.width
                 height: rowText.implicitHeight + Style.space(4)
                 color: rowDelegate.index === root.cursorIndex ? Color.menu.selectedBackground : "transparent"
+                opacity: root.rowOpacity(rowDelegate.modelData)
+
+                Text {
+                  width: Style.space(80)
+                  visible: rowDelegate.modelData.kind === "recent"
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: root.timeGutter(rowDelegate.modelData)
+                  color: Color.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                }
 
                 Text {
                   id: rowText
                   anchors.left: parent.left
+                  anchors.leftMargin: rowDelegate.modelData.kind === "recent" ? Style.space(80) : 0
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   textFormat: Text.StyledText

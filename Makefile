@@ -1,25 +1,19 @@
 PLUGIN_DIR := $(HOME)/.config/omarchy/plugins/uchi
 REPO_DIR := $(CURDIR)
 
-# Quickshell's plugin loader rejects a bar-widget entry point reached through
-# a symlinked plugin folder ("File name case mismatch" — the service kind
-# tolerates it, bar-widget doesn't). A bind mount makes the folder look like
-# a real directory to the loader while still editing the same files live.
-# Re-run after every reboot — a bind mount doesn't persist on its own.
-.PHONY: dev-mount
-dev-mount:
-	@if mountpoint -q "$(PLUGIN_DIR)"; then \
-		echo "already mounted: $(PLUGIN_DIR)"; \
-	else \
-		mkdir -p "$(PLUGIN_DIR)"; \
-		sudo mount --bind "$(REPO_DIR)" "$(PLUGIN_DIR)" && echo "mounted $(REPO_DIR) -> $(PLUGIN_DIR)"; \
-	fi
-
-.PHONY: dev-unmount
-dev-unmount:
-	@if mountpoint -q "$(PLUGIN_DIR)"; then \
-		sudo umount "$(PLUGIN_DIR)"; \
-		echo "unmounted $(PLUGIN_DIR)"; \
-	else \
-		echo "not mounted: $(PLUGIN_DIR)"; \
-	fi
+# Omarchy's shell watches ~/.config/omarchy/plugins recursively (inotifywait,
+# in PluginRegistry.qml) and reloads every plugin widget on any write under
+# it, regardless of which plugin changed or whether it's enabled — there's no
+# way to scope or disable that watch. Editing this repo in place, live at
+# that path, means every single edit flickers the whole bar. Deploying is a
+# copy instead: the repo stays untouched by the watcher while editing, and a
+# single `make dev-deploy` is the one deliberate point where the shell
+# reloads, picking up everything changed since the last deploy at once.
+# Also sidesteps Quickshell's "File name case mismatch" error, which a
+# symlinked (or bind-mounted) plugin folder triggers for a bar-widget entry
+# point specifically — a real copied directory doesn't.
+.PHONY: dev-deploy
+dev-deploy:
+	@mkdir -p "$(PLUGIN_DIR)"
+	@rsync -a --delete --exclude=.git "$(REPO_DIR)/" "$(PLUGIN_DIR)/"
+	@echo "deployed $(REPO_DIR) -> $(PLUGIN_DIR)"
