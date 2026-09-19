@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolve } from "../grammar.mjs";
+import { resolve, previewRowForAction } from "../grammar.mjs";
 import { devices, zones } from "./fixture.mjs";
 
 test('"desk 40" resolves to the Desk Lamp\'s dim capability, percent-converted', () => {
@@ -106,6 +106,57 @@ test("a multi-kind zone with a bare number needs a word, not a guess", () => {
   assert.equal(result.matches[0].why, "needs a word");
 });
 
+test('"living room light off" turns off every light in the zone, not just one', () => {
+  const result = resolve("living room light off", { devices, zones });
+  assert.equal(result.action, undefined);
+  assert.equal(result.actions.length, 5);
+  assert.ok(result.actions.every((a) => a.capabilityId === "onoff" && a.value === false));
+  const ids = result.actions.map((a) => a.deviceId).sort();
+  assert.deepEqual(ids, [
+    "living-floor-lamp",
+    "living-light-2",
+    "living-light-3",
+    "living-light-4",
+    "living-reading-lamp",
+  ]);
+});
+
+test('"living room light 40" dims every light in the zone to 40%, not the speaker or thermostat', () => {
+  const result = resolve("living room light 40", { devices, zones });
+  assert.equal(result.actions.length, 5);
+  assert.ok(result.actions.every((a) => a.capabilityId === "dim" && a.value === 0.4));
+});
+
+test('"living room temp 21" reaches the zone\'s thermostat via the word, not a bare number', () => {
+  const result = resolve("living room temp 21", { devices, zones });
+  assert.deepEqual(result.actions, [{ deviceId: "living-thermostat", capabilityId: "target_temperature", value: 21 }]);
+});
+
+test('"living room vol 30" reaches the zone\'s speaker via the word', () => {
+  const result = resolve("living room vol 30", { devices, zones });
+  assert.deepEqual(result.actions, [{ deviceId: "living-speaker", capabilityId: "volume_set", value: 0.3 }]);
+});
+
+test("an unrecognized word after a zone is a dead end, not a guess", () => {
+  const result = resolve("living room xyz 40", { devices, zones });
+  assert.equal(result.actions, undefined);
+  assert.equal(result.matches[0].why, "needs a word");
+});
+
+test("a zone + word with no trailing value needs a verb or number", () => {
+  const result = resolve("living room light", { devices, zones });
+  assert.equal(result.actions, undefined);
+  assert.equal(result.matches[0].why, "needs a verb or number");
+});
+
+test("a word matching a capability the zone doesn't have is a dead end", () => {
+  // The Bedroom has a thermostat but no speaker — "vol" shouldn't silently
+  // fall back to some other capability.
+  const result = resolve("bedroom vol 30", { devices, zones });
+  assert.equal(result.actions, undefined);
+  assert.equal(result.matches[0].why, "no vol here");
+});
+
 test('"front door unlock" resolves to the locked capability, value false', () => {
   const result = resolve("front door unlock", { devices, zones });
   assert.deepEqual(result, {
@@ -120,6 +171,19 @@ test('a bare "front door" (no verb or number) needs a verb or number, not "front
   assert.equal(result.matches.length, 1);
   assert.equal(result.matches[0].label, "Front Door");
   assert.equal(result.matches[0].why, "needs a verb or number");
+});
+
+test("a device-specific dead end still carries deviceClass, for a client to pick an icon", () => {
+  const result = resolve("desk", { devices, zones });
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].why, "needs a verb or number");
+  assert.equal(result.matches[0].deviceClass, "light");
+});
+
+test("previewRowForAction builds the same candidate-row shape as an ambiguous/dead-end match", () => {
+  const { action } = resolve("desk 40", { devices, zones });
+  const row = previewRowForAction(action, devices, zones, "desk 40");
+  assert.deepEqual(row, { label: "Desk Lamp", why: "40%", zone: "Office", deviceClass: "light", line: "desk 40" });
 });
 
 test('a bare "office" resolves to a room query, not a device match', () => {
@@ -240,6 +304,18 @@ test("an exact match at a shorter length beats a same-length prefix match on a d
   const withZone = result.matches.filter((m) => m.zone !== undefined);
   assert.equal(withZone.length, 1);
   assert.equal(withZone[0].zone, "Attic");
+});
+
+test("an ambiguous match carries kind/deviceClass, for a client to tell a device candidate from a zone candidate", () => {
+  // Same device/zone tie as above — one candidate is the "Attic" zone
+  // itself, the other the "Attic" speaker device, both named identically.
+  const result = resolve("attic", { devices, zones });
+  const zoneMatch = result.matches.find((m) => m.kind === "zone");
+  const deviceMatch = result.matches.find((m) => m.kind === "device");
+  assert.ok(zoneMatch);
+  assert.ok(deviceMatch);
+  assert.equal(zoneMatch.zone, undefined);
+  assert.equal(deviceMatch.deviceClass, "speaker");
 });
 
 test("a single-token compound name resolves via substring fallback, not a required full-word type", () => {

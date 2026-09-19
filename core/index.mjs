@@ -17,7 +17,7 @@ import { createRpcServer } from "./rpc.mjs";
 import * as log from "./log.mjs";
 import * as recent from "./recent.mjs";
 import * as here from "./here.mjs";
-import { resolve, run, formatCapabilityWhy } from "./grammar.mjs";
+import { resolve, run, previewRowForAction } from "./grammar.mjs";
 
 const IDLE_EXIT_MS = 60_000;
 const NOTIFICATION_POLL_MS = 30_000;
@@ -197,7 +197,8 @@ async function main() {
   function logCapabilityChange({ deviceId, capabilityId, from, to }) {
     const deviceName = devices[deviceId]?.name ?? startupDeviceNames.get(deviceId);
     const zoneName = zones[devices[deviceId]?.zone]?.name;
-    if (log.append({ deviceId, deviceName, zoneName, capabilityId, from, to, cause: null })) notifyChanged();
+    const deviceClass = devices[deviceId]?.class;
+    if (log.append({ deviceId, deviceName, zoneName, deviceClass, capabilityId, from, to, cause: null })) notifyChanged();
   }
 
   function scheduleDeviceChangeDecision(deviceId, delayMs) {
@@ -312,7 +313,15 @@ async function main() {
     }
 
     currentValue.set(key, homeyValue);
-    return { deviceId: device.id, deviceName: device.name, zoneName: zones[device.zone]?.name, capabilityId, from, to: homeyValue };
+    return {
+      deviceId: device.id,
+      deviceName: device.name,
+      zoneName: zones[device.zone]?.name,
+      deviceClass: device.class,
+      capabilityId,
+      from,
+      to: homeyValue,
+    };
   }
 
   async function write(device, capabilityId, homeyValue) {
@@ -449,9 +458,11 @@ async function main() {
       if (result.room) return { matches: [], room: result.room };
 
       if (result.action) {
-        const label = devices[result.action.deviceId]?.name;
-        const why = formatCapabilityWhy(result.action.capabilityId, result.action.value);
-        return { matches: [{ label, line: params.text, why }] };
+        return { matches: [previewRowForAction(result.action, devices, zones, params.text)] };
+      }
+
+      if (result.actions) {
+        return { matches: result.actions.map((a) => previewRowForAction(a, devices, zones, params.text)) };
       }
 
       return result.rest ? { matches: result.matches, rest: result.rest } : { matches: result.matches };
@@ -460,7 +471,12 @@ async function main() {
     "prompt.run": async (params) => {
       const result = await run(params.line ?? "", { devices, zones, setCapabilityValue: write, notches: coreConfig.notches });
       if (result.ok) {
-        if (log.append({ ...result.change, cause: "prompt" })) notifyChanged();
+        const changes = result.changes ?? [result.change];
+        let changed = false;
+        for (const change of changes) {
+          if (log.append({ ...change, cause: "prompt" })) changed = true;
+        }
+        if (changed) notifyChanged();
         return { ok: true };
       }
       return result;
