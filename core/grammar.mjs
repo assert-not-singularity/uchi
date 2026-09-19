@@ -157,8 +157,8 @@ function ambiguous(matches, zones, rest) {
   return result;
 }
 
-function deadEnd(label, why, zone, deviceClass) {
-  return { matches: [candidateRow(label, why, { zone, deviceClass })] };
+function deadEnd(label, why, zone, deviceClass, kind) {
+  return { matches: [candidateRow(label, why, { zone, deviceClass, kind })] };
 }
 
 // prompt.resolve's preview of an already-resolved action, before Enter runs
@@ -317,35 +317,35 @@ function matchWord(token) {
 // narrower range shouldn't block every other device the word matched.
 function resolveZoneWord(zoneThing, restTokens, devices, notches) {
   const word = matchWord(restTokens[0]);
-  if (!word) return deadEnd(zoneThing.name, "needs a word");
+  if (!word) return deadEnd(zoneThing.name, "needs a word", undefined, undefined, "zone");
 
   const capabilityId = WORD_CAPABILITY[word];
   const members = Object.values(devices).filter(
     (d) => d.zone === zoneThing.id && d.capabilitiesObj?.[capabilityId]?.setable
   );
-  if (members.length === 0) return deadEnd(zoneThing.name, `no ${word} here`);
+  if (members.length === 0) return deadEnd(zoneThing.name, `no ${word} here`, undefined, undefined, "zone");
 
   const valueText = restTokens.slice(1).join(" ").trim();
-  if (valueText === "") return deadEnd(zoneThing.name, "needs a verb or number");
+  if (valueText === "") return deadEnd(zoneThing.name, "needs a verb or number", undefined, undefined, "zone");
 
   const lowerValue = valueText.toLowerCase();
   if (lowerValue === "on" || lowerValue === "off") {
     const actions = members
       .filter((d) => d.capabilitiesObj?.onoff?.setable)
       .map((d) => ({ deviceId: d.id, capabilityId: "onoff", value: lowerValue === "on" }));
-    if (actions.length === 0) return deadEnd(zoneThing.name, `no ${word} here`);
+    if (actions.length === 0) return deadEnd(zoneThing.name, `no ${word} here`, undefined, undefined, "zone");
     return { matches: [], actions };
   }
 
   const parsed = parseValue(valueText);
-  if (!parsed) return deadEnd(zoneThing.name, "needs a number");
+  if (!parsed) return deadEnd(zoneThing.name, "needs a number", undefined, undefined, "zone");
 
   const actions = [];
   for (const device of members) {
     const applied = applyValue(device, capabilityId, parsed, notches);
     if (applied.value !== undefined) actions.push({ deviceId: device.id, capabilityId, value: applied.value });
   }
-  if (actions.length === 0) return deadEnd(zoneThing.name, "needs a different value");
+  if (actions.length === 0) return deadEnd(zoneThing.name, "needs a different value", undefined, undefined, "zone");
   return { matches: [], actions };
 }
 
@@ -394,7 +394,7 @@ function narrowByZone(candidates, restTokens, zones, notches) {
   }
 
   const anyMatch = matchThing(restTokens, toZoneThings(Object.values(zones)));
-  if (anyMatch.matches.length === 1) return deadEnd(anyMatch.matches[0].name, "no match there");
+  if (anyMatch.matches.length === 1) return deadEnd(anyMatch.matches[0].name, "no match there", undefined, undefined, "zone");
 
   return null;
 }
@@ -458,14 +458,22 @@ export async function run(line, { devices, zones, setCapabilityValue, notches })
   if (result.actions) {
     // Each device writes independently — one device rejecting (offline,
     // Homey error) shouldn't undo or block the others a zone+word batch
-    // already resolved to a value for.
+    // already resolved to a value for. A partial failure still reports
+    // `ok: true` (the devices that did apply really did change), but
+    // carries `failed` so the caller can tell a clean success from a batch
+    // where some devices were silently skipped, rather than losing the
+    // rejected ones' errors entirely.
     const settled = await Promise.allSettled(
       result.actions.map((a) => setCapabilityValue(devices[a.deviceId], a.capabilityId, a.value))
     );
     const changes = settled.filter((s) => s.status === "fulfilled").map((s) => s.value);
-    if (changes.length > 0) return { ok: true, changes };
-    const firstError = settled.find((s) => s.status === "rejected")?.reason;
-    return { ok: false, error: firstError?.message ? firstError.message : String(firstError) };
+    const failed = settled
+      .filter((s) => s.status === "rejected")
+      .map((s) => (s.reason && s.reason.message ? s.reason.message : String(s.reason)));
+    if (changes.length === 0) {
+      return { ok: false, error: failed[0] ?? "all writes failed" };
+    }
+    return failed.length > 0 ? { ok: true, changes, failed } : { ok: true, changes };
   }
 
   if (result.room) return { ok: false, room: result.room };

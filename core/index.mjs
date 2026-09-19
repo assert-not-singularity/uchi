@@ -477,7 +477,7 @@ async function main() {
           if (log.append({ ...change, cause: "prompt" })) changed = true;
         }
         if (changed) notifyChanged();
-        return { ok: true };
+        return result.failed ? { ok: true, failed: result.failed } : { ok: true };
       }
       return result;
     },
