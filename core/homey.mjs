@@ -30,8 +30,7 @@ export async function getNotifications(api) {
 // homey-api's own types.
 export const GROUP_DRIVER_ID = "homey:virtualdrivergroup:driver";
 
-// The Uchi artifact's Recent "In" list, more precise than design.md's own
-// prose summary — see docs/phase-2-plan.md's core/validate.mjs bullet.
+// A more precise version of docs/design.md's "What counts as Recent" list.
 export const DISCRETE_CAPABILITIES = new Set([
   "onoff",
   "dim",

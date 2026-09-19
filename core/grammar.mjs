@@ -299,8 +299,7 @@ function narrowByZone(candidates, restTokens, zones, notches) {
 }
 
 // prompt.resolve's implementation: always { matches: [...] } plus optionally
-// exactly one of room or action — see docs/phase-2-plan.md's grammar.mjs
-// section for why this one shape is load-bearing for run() below.
+// exactly one of room or action. run() below reuses this same shape.
 export function resolve(text, { devices, zones, notches }) {
   const trimmed = text.trim();
   if (trimmed === "") return { matches: [] };

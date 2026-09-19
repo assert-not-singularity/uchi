@@ -17,26 +17,54 @@ has no `attention.mjs`, `habits.mjs`, or `model.mjs`.
 ## How to use it
 
 Click the bar pill to open the panel, or type in the prompt directly. A line
-names a thing (device, zone, or mood) and, if it needs one, a verb or value:
+names a device or zone and, if it needs one, a verb or value:
 
 - `desk 40` — dims the Desk Lamp to 40%
+- `desk +10` / `desk *2` / `desk ++` — steps, scales, or notches it instead
+  of setting an absolute value
 - `front door unlock` — unlocks the Front Door
-- `movie night` — activates the Movie Night mood
-- `office` — lists the Office's devices and pins it as Here
+- `office` — lists the Office's devices; pressing **Enter** on this row (panel
+  only, not `bin/uchi`) pins it as Here until another room is queried
 
 `↑`/`↓` moves the cursor over a candidate list when a line is ambiguous;
-`Enter` runs the highlighted line. See `docs/design.md`'s "Example prompts"
-table for the full grammar (zones, kinds like `light`/`son`/`temp`, step/
-scale/notch values, chaining). The same lines work from a terminal via
-`bin/uchi <line>` — see below.
+`Enter` runs the highlighted line. Moods, flows, the `kind` grammar
+(`light`/`son`/`temp`), and chaining (`,`/`;`) are in `docs/design.md`'s
+grammar section as the target design — not implemented yet; phases 1–3 cover
+device/zone matching, the four verbs (`on`/`off`/`lock`/`unlock`), and the
+absolute/step/scale/notch value forms. The same lines work from a terminal
+via `bin/uchi <line>` — see below.
+
+### How a line resolves
+
+```mermaid
+flowchart TD
+    A["type a line"] --> B{"exact or fuzzy name match\n(device/zone)"}
+    B -- "unique" --> C{"needs a word or value?"}
+    B -- "none" --> Z["dead end: why"]
+    B -- "more than one" --> D{"trailing zone name\nnarrows it?"}
+    D -- "yes" --> C
+    D -- "no" --> E["ambiguous candidate list\n(pick one, or type more)"]
+    C -- "no" --> F["run the write"]
+    C -- "yes, and given" --> G{"in range?"}
+    G -- "yes" --> F
+    G -- "no" --> Z
+    C -- "yes, but missing" --> Z
+```
+
+`prompt.resolve` runs this on every keystroke (side-effect-free, live
+candidates); `prompt.run` runs it once more on **Enter** and, only if it
+reaches "run the write", actually performs it. There's no agent fallback
+yet — a line that dead-ends just dead-ends (phase 6 in `docs/design.md`'s
+build order, not started).
 
 ## Running it
 
-`uchi setup` (via `gum`) writes the Homey address and API token to
+`bin/uchi setup` (via `gum`) writes the Homey address and API token to
 `~/.local/state/omarchy/settings/uchi.json`, mode `0600`. `Service.qml` spawns
 the core and connects over `$XDG_RUNTIME_DIR/uchi.sock`; `bin/uchi <line>`,
 `bin/uchi status`, and `bin/uchi rpc <method> [paramsJson]` talk to the same
-socket from a terminal.
+socket from a terminal. There's no installed `uchi` command yet — everything
+runs as `bin/uchi` from a checkout.
 
 ### Local development
 

@@ -9,8 +9,7 @@ function isSetable(device, capabilityId) {
 
 // A device can have more than one of the six controllable capabilities at
 // once (an ordinary light has both onoff and dim), so picking one needs
-// several passes, not one flat priority order — see
-// docs/phase-2-plan.md's here.mjs section for why each pass exists.
+// several passes, not one flat priority order.
 function pickCapability(device) {
   const caps = device.capabilitiesObj ?? {};
 

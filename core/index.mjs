@@ -342,7 +342,7 @@ async function main() {
   // Two counters, not one: startedGeneration marks every call that begins;
   // publishedGeneration tracks the highest generation that actually
   // published, so a failed newer call can never permanently block an older
-  // one's good data — see docs/phase-2-plan.md's rpc.mjs section.
+  // one's good data.
   let startedGeneration = 0;
   let publishedGeneration = 0;
 

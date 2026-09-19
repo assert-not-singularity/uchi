@@ -241,10 +241,12 @@ since no such wrapper exists yet to design it against.
 
 ## Keyboard (interactive wrappers)
 
-Typing, `↑`/`↓` (or `j`/`k`) to move the cursor over a `prompt.resolve`
-candidate list, `Enter` to run the highlighted candidate's `line` through
-`prompt.run`, and `Esc`/`Backspace` to clear the prompt or close the panel.
-That's the complete set.
+Typing, `↑`/`↓` to move the cursor over a `prompt.resolve` candidate list,
+`Enter` to run the highlighted candidate's `line` through `prompt.run`,
+`Backspace` to delete the prompt's last character (a no-op on an empty
+prompt), and `Esc` to clear the prompt if it holds text or else close the
+panel. That's the complete set — `j`/`k` are not bound; typed as ordinary
+prompt text.
 
 Every other key this section once specified — `Tab`, `Shift+Tab`, `h`/`l`
 (notch step), `x` (dismiss/mute), `s` (snooze), and `a` (all off) — is
@@ -252,9 +254,11 @@ deliberately absent, not just unbound. A capability like `onoff` can't tell a
 light from a socket keeping other equipment powered, so a hotkey that acts on
 "whatever's under the cursor" or "everything in this room" with no per-device
 judgment is unsafe by construction; see "Explicitly decided against" below.
-`row.dismiss`/`row.snooze`/`row.mute` still exist as RPC methods (Attention/
-Habits rows can propose them once phase 4/5 build the sections that need
-them) — only the blind keyboard shortcuts for them are rejected.
+`row.dismiss`/`row.snooze`/`row.mute` are planned RPC methods, not yet in the
+dispatch table (`room.pin`/`room.unpin` are the only ones of this group
+implemented so far) — Attention/Habits rows can propose them once phase 4/5
+build the sections that need them; only the blind keyboard shortcuts for
+this whole group are rejected outright, not just deferred.
 
 A one-shot caller (`bin/uchi`) has none of this — see `prompt.resolve` above
 for how it handles the same ambiguity without an interactive loop to navigate.
