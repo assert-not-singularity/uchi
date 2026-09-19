@@ -9,8 +9,11 @@ How any Markdown in the repo should read — commit messages, PR bodies, READMEs
 
 ## Content honesty
 
-- **Document what exists.** Describe the current behaviour; MUST NOT describe planned or
-  hypothetical features.
+- **Document what exists.** Docstrings, comments, commit messages, PR bodies, and reference
+  docs describing current code or behaviour MUST NOT describe planned or hypothetical features
+  as already built. A document whose stated purpose is a design or a plan — its title or
+  opening line says so — is doing its actual job when it describes target and future state;
+  this bullet doesn't restrict that kind of writing.
 - **No historical narration.** Docstrings, comments, commit messages, PR bodies, and doc prose
   describe what the code **does now** — never what it used to do, the bug it had, or the
   investigation that led here. State the current behaviour (and, for commits/PRs, the one-line
@@ -22,10 +25,12 @@ How any Markdown in the repo should read — commit messages, PR bodies, READMEs
     that exists only because the text used to say otherwise. State the current fact plainly.
     **Exception:** keep a "not X" framing when X is a real, live alternative a reader would
     otherwise assume (a genuine disambiguation, not narration).
-- **Verify before you state it.** MUST confirm that every class, method, column, config key, and
-  CLI command exists (grep, read the source) before naming it. When you cannot verify, describe
-  generically or state the uncertainty — MUST NOT fabricate an API signature, column name, or
-  example.
+- **Verify before you state it.** For docs describing current code or behaviour, MUST confirm
+  that every class, method, column, config key, and CLI command exists (grep, read the source)
+  before naming it. When you cannot verify, describe generically or state the uncertainty — MUST
+  NOT fabricate an API signature, column name, or example. A design or plan document naming a
+  target method or field that doesn't exist yet (per the exception above) isn't a fabrication —
+  it's the document specifying what to build.
 
 ## Voice
 
