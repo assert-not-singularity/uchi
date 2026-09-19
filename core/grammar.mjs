@@ -215,7 +215,7 @@ function deadEnd(label, why, zone, deviceClass, kind) {
 // discard alongside dead ends that matched nothing at all. Distinct from
 // pendingScope below, which isn't a dead end at all.
 function progressedDeadEnd(label, why, zone, deviceClass) {
-  return { ...deadEnd(label, why, zone, deviceClass), progressed: true };
+  return { ...deadEnd(label, why, zone, deviceClass, "zone"), progressed: true };
 }
 
 // A scope's own label, qualified with the capability word that picked it —
