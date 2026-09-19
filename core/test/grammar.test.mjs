@@ -57,8 +57,50 @@ test("two devices sharing an exact name resolve as ambiguous, zone-qualified can
   assert.equal(result.action, undefined);
   assert.equal(result.room, undefined);
   assert.equal(result.matches.length, 2);
-  const labels = result.matches.map((m) => m.label).sort();
-  assert.deepEqual(labels, ["Reading Lamp (Living Room)", "Reading Lamp (Office)"]);
+  assert.ok(result.matches.every((m) => m.label === "Reading Lamp"));
+  const resultZones = result.matches.map((m) => m.zone).sort();
+  assert.deepEqual(resultZones, ["Living Room", "Office"]);
+});
+
+test("a trailing zone name narrows an ambiguous exact-name match to one device", () => {
+  const result = resolve("reading lamp office 40", { devices, zones });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-reading-lamp", capabilityId: "dim", value: 0.4 },
+  });
+});
+
+test("the other zone narrows the same ambiguous name to the other device", () => {
+  const result = resolve("reading lamp living 40", { devices, zones });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "living-reading-lamp", capabilityId: "dim", value: 0.4 },
+  });
+});
+
+test("a zone with no matching device among the ambiguous set is a dead end", () => {
+  const result = resolve("reading lamp kitchen", { devices, zones });
+  assert.equal(result.action, undefined);
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].label, "Kitchen");
+  assert.equal(result.matches[0].why, "no match there");
+});
+
+test("a trailing word that isn't a zone leaves the ambiguous list untouched", () => {
+  const result = resolve("reading lamp foo", { devices, zones });
+  assert.equal(result.matches.length, 2);
+});
+
+test("zone-narrowing matches only the ambiguous candidates' own zones, not every zone in the house", () => {
+  // "ic" is a substring of both "Office" (one of Reading Lamp's two zones)
+  // and "Attic" (a real zone, but not one either Reading Lamp is in) — it
+  // must narrow to Office without "Attic" diluting it into a tie, since
+  // Attic was never a real candidate here.
+  const result = resolve("reading lamp ic 40", { devices, zones });
+  assert.deepEqual(result, {
+    matches: [],
+    action: { deviceId: "office-reading-lamp", capabilityId: "dim", value: 0.4 },
+  });
 });
 
 test("an exact match at a shorter length beats a same-length prefix match on a different, longer name", () => {
@@ -69,8 +111,10 @@ test("an exact match at a shorter length beats a same-length prefix match on a d
   assert.equal(result.action, undefined);
   assert.equal(result.room, undefined);
   assert.equal(result.matches.length, 2);
-  const labels = result.matches.map((m) => m.label).sort();
-  assert.deepEqual(labels, ["Attic", "Attic (Attic)"]);
+  assert.ok(result.matches.every((m) => m.label === "Attic"));
+  const withZone = result.matches.filter((m) => m.zone !== undefined);
+  assert.equal(withZone.length, 1);
+  assert.equal(withZone[0].zone, "Attic");
 });
 
 test("a single-token compound name resolves via substring fallback, not a required full-word type", () => {

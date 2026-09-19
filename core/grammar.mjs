@@ -15,12 +15,6 @@ function things(devices, zones) {
   return result;
 }
 
-function qualifyLabel(thing, zones) {
-  if (thing.kind !== "device") return thing.name;
-  const zone = zones[thing.zone];
-  return zone ? `${thing.name} (${zone.name})` : thing.name;
-}
-
 // Stage one, unified: a full-name match is just the degenerate case of a
 // prefix match (a prefix that happens to consume the whole name), so exact,
 // token-prefix, and substring matching aren't three independent passes —
@@ -85,16 +79,20 @@ function matchThing(tokens, all) {
 // something a person can actually scan, not a rendering hazard.
 const MAX_AMBIGUOUS_MATCHES = 20;
 
+// `zone` is a separate field, not baked into `label` — a client renders it
+// as its own dimmed suffix the same way it does for a Recent row's zone,
+// rather than every row kind inventing its own "name (zone)" text.
 function ambiguous(matches, zones) {
   return {
-    matches: matches
-      .slice(0, MAX_AMBIGUOUS_MATCHES)
-      .map((t) => ({ label: qualifyLabel(t, zones), why: "ambiguous — pick one" })),
+    matches: matches.slice(0, MAX_AMBIGUOUS_MATCHES).map((t) => {
+      const zoneName = t.kind === "device" ? zones[t.zone]?.name : undefined;
+      return zoneName ? { label: t.name, zone: zoneName, why: "ambiguous — pick one" } : { label: t.name, why: "ambiguous — pick one" };
+    }),
   };
 }
 
-function deadEnd(label, why) {
-  return { matches: [{ label, why }] };
+function deadEnd(label, why, zone) {
+  return { matches: [zone ? { label, why, zone } : { label, why }] };
 }
 
 // The one shared function for a capability's current-value description —
@@ -136,32 +134,16 @@ export function lineFor(deviceName, capabilityId, value) {
   }
 }
 
-// prompt.resolve's implementation: always { matches: [...] } plus optionally
-// exactly one of room or action — see docs/phase-2-plan.md's grammar.mjs
-// section for why this one shape is load-bearing for run() below.
-export function resolve(text, { devices, zones }) {
-  const trimmed = text.trim();
-  if (trimmed === "") return { matches: [] };
-
-  const tokens = trimmed.split(/\s+/);
-  const all = things(devices, zones);
-
-  const matched = matchThing(tokens, all);
-  if (matched.matches.length === 0) return { matches: [] };
-  if (matched.matches.length > 1) return ambiguous(matched.matches, zones);
-
-  const thing = matched.matches[0];
-  const rest = tokens.slice(matched.consumed).join(" ").trim();
-
-  if (thing.kind === "zone") {
-    if (rest === "") return { matches: [], room: { id: thing.id, name: thing.name } };
-    // Words/kinds beyond a bare zone query are the full word grammar,
-    // deferred past this phase — a zone with anything after it is a dead end.
-    return deadEnd(thing.name, "needs a word");
-  }
-
-  const device = thing.ref;
+// A device thing, once resolved to exactly one, plus whatever's left of the
+// input — the word/value half of the grammar. Split out from resolve() so
+// both an ordinary single match and a zone-narrowed one (see narrowByZone
+// below) reach it the same way. Every dead end carries the device's own
+// zone (not just the ambiguous list that came before it) — the zone that
+// distinguished this device a moment ago shouldn't vanish the instant it
+// resolves to one.
+function resolveDevice(device, rest, zones) {
   const capsObj = device.capabilitiesObj ?? {};
+  const zoneName = zones[device.zone]?.name;
 
   if (VERB_WORDS.has(rest.toLowerCase())) {
     const word = rest.toLowerCase();
@@ -175,13 +157,13 @@ export function resolve(text, { devices, zones }) {
     // bare-number step below, which rejects it as non-numeric.
   }
 
-  if (rest === "") return deadEnd(thing.name, "needs a verb or number");
+  if (rest === "") return deadEnd(device.name, "needs a verb or number", zoneName);
 
   const numeric = Number(rest);
-  if (!Number.isFinite(numeric)) return deadEnd(thing.name, "needs a number");
+  if (!Number.isFinite(numeric)) return deadEnd(device.name, "needs a number", zoneName);
 
   const setableNumeric = NUMERIC_TARGETS.filter((id) => capsObj[id]?.setable);
-  if (setableNumeric.length !== 1) return deadEnd(thing.name, "needs a word");
+  if (setableNumeric.length !== 1) return deadEnd(device.name, "needs a word", zoneName);
 
   const capabilityId = setableNumeric[0];
   const value = PERCENT_CAPABILITIES.has(capabilityId) ? toHomeyValue(capabilityId, numeric) : numeric;
@@ -190,10 +172,90 @@ export function resolve(text, { devices, zones }) {
   if (value < min || value > max) {
     const displayMin = PERCENT_CAPABILITIES.has(capabilityId) ? toDisplayPercent(capabilityId, min) : min;
     const displayMax = PERCENT_CAPABILITIES.has(capabilityId) ? toDisplayPercent(capabilityId, max) : max;
-    return deadEnd(thing.name, `needs ${displayMin}–${displayMax}`);
+    return deadEnd(device.name, `needs ${displayMin}–${displayMax}`, zoneName);
   }
 
   return { matches: [], action: { deviceId: device.id, capabilityId, value } };
+}
+
+// A trailing zone name is the only way to reach one specific device when
+// several share the exact same literal Homey name — a real, common naming
+// pattern (this house's own fixture has two "Reading Lamp"s), not a
+// hypothetical. Word/value semantics never apply to a still-ambiguous set
+// (every existing grammar form requires a single resolved thing first), so
+// there's no competing interpretation for the leftover tokens to be
+// disambiguated against here — trying them as a zone is the only thing that
+// can possibly resolve further.
+//
+// Matched against the candidates' own zones first, not every zone in the
+// house — confirmed live against a real house: "decken fl" must narrow to
+// Flur among {Küche, Badezimmer, Flur, Schlafzimmer} even though "fl" is
+// also a substring of "Pflanzen", a zone none of these candidates are even
+// in and so isn't a real competing interpretation. Only if that first pass
+// doesn't narrow to one does it check the whole house's zones — solely to
+// return a clean "no match there" when the trailing text names a real zone
+// that just isn't one of the candidates', rather than silently falling
+// through to the unqualified ambiguous list.
+function narrowByZone(candidates, restTokens, zones) {
+  if (restTokens.length === 0) return null;
+
+  const toZoneThings = (list) => list.map((z) => ({ kind: "zone", id: z.id, name: z.name }));
+
+  const relevantZoneIds = new Set(candidates.map((t) => t.zone));
+  const relevantZones = [...relevantZoneIds].map((id) => zones[id]).filter(Boolean);
+  const relevantMatch = matchThing(restTokens, toZoneThings(relevantZones));
+
+  if (relevantMatch.matches.length === 1) {
+    const zone = relevantMatch.matches[0];
+    const narrowed = candidates.filter((t) => t.zone === zone.id);
+    const afterZone = restTokens.slice(relevantMatch.consumed).join(" ").trim();
+    if (narrowed.length > 1) return ambiguous(narrowed, zones);
+    return resolveDevice(narrowed[0].ref, afterZone, zones);
+  }
+
+  const anyMatch = matchThing(restTokens, toZoneThings(Object.values(zones)));
+  if (anyMatch.matches.length === 1) return deadEnd(anyMatch.matches[0].name, "no match there");
+
+  return null;
+}
+
+// prompt.resolve's implementation: always { matches: [...] } plus optionally
+// exactly one of room or action — see docs/phase-2-plan.md's grammar.mjs
+// section for why this one shape is load-bearing for run() below.
+export function resolve(text, { devices, zones }) {
+  const trimmed = text.trim();
+  if (trimmed === "") return { matches: [] };
+
+  const tokens = trimmed.split(/\s+/);
+  const all = things(devices, zones);
+
+  const matched = matchThing(tokens, all);
+  if (matched.matches.length === 0) return { matches: [] };
+
+  const rest = tokens.slice(matched.consumed);
+
+  if (matched.matches.length > 1) {
+    // Zone-narrowing only makes sense among devices — a tie that includes a
+    // zone (e.g. "Attic" the zone vs. "Attic" the device) has no zone of
+    // its own to narrow by, and stays exactly as ambiguous as today.
+    if (matched.matches.every((t) => t.kind === "device")) {
+      const narrowed = narrowByZone(matched.matches, rest, zones);
+      if (narrowed) return narrowed;
+    }
+    return ambiguous(matched.matches, zones);
+  }
+
+  const thing = matched.matches[0];
+  const restText = rest.join(" ").trim();
+
+  if (thing.kind === "zone") {
+    if (restText === "") return { matches: [], room: { id: thing.id, name: thing.name } };
+    // Words/kinds beyond a bare zone query are the full word grammar,
+    // deferred past this phase — a zone with anything after it is a dead end.
+    return deadEnd(thing.name, "needs a word");
+  }
+
+  return resolveDevice(thing.ref, restText, zones);
 }
 
 // prompt.run's implementation: re-resolves `line` and, if it names an
