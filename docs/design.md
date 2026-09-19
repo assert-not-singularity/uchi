@@ -92,7 +92,7 @@ keystroke rather than guessing.
 ## The prompt grammar
 
 ```
-[thing[+thing…]] [-thing…] [word] [value] [, segment…]
+[thing[+thing…]] [!thing[+thing…]] [word] [value] [, segment…]
 
 thing    device name · zone name · mood · flow · kind (son=every Sonos,
          light=every light, temp=every thermostat) · omitted = whole house
@@ -127,6 +127,24 @@ a unique hit resolves, more than one is an ambiguous candidate list exactly like
 exact match's own tie case, never a silently auto-picked "best guess" — this
 grammar writes to real devices, so it never guesses when it isn't sure.
 
+**Resolving a query is not just matching a thing.** The grammar-parse stage enumerates every way
+the whole input could validly parse, evaluates each to see whether it terminates in something
+complete (a resolved write, a room query, an activated mood/flow) or dead-ends needing more
+input, and returns whichever readings are complete. A dead-ending reading never competes with a
+complete one, no matter how much more of the input it consumed or how literally it matched —
+completeness always outranks exactness. When more than one reading is complete (a specific
+device's own exact name, *and* the same value applied to every device a `kind`/zone+word batch
+would also reach), all of them come back together as candidates, not narrowed to one.
+
+Three layers, each built on the one below:
+- **chain** (`,`/`;`, outermost) — splits the input into independent segments; a segment that
+  starts with a `word` inherits the previous segment's subject.
+- **join/exclusion** (`+`/`!`, per segment) — the leading thing-list's elements are each resolved
+  independently (device, zone, mood, flow, or `kind`), then their matched device sets are unioned,
+  minus anything matching a trailing `!thing[+thing…]` group.
+- **word/value** (per segment, over the resulting device set) — resolved as one action for a
+  single device, or a batch write across every matching member for a set.
+
 The system always wants the least you can type. Every match — thing, word, or
 an otherwise-ambiguous value target — narrows as you type rather than requiring
 a fully-qualified line up front: enough keystrokes to be unique resolves
@@ -134,9 +152,10 @@ outright, and anything less that still narrows the field is a candidate to pick
 from, not something to keep typing past. The rules below (word prefixes, the
 value-target default) are instances of this one principle, not separate ones.
 
-Sign disambiguation: a sign before digits is a step (`+10`); before a name it's an
-exclusion (`-kitchen`) or (as `+`) a join (`kitchen+office`); alone, doubled, it's a
-notch (`kitchen++`).
+Sign disambiguation: a sign before digits is a step (`+10`/`-10`); a sign alone,
+doubled, after a name is a notch (`kitchen++`/`kitchen--`). `+`/`!` before a name are
+unambiguous on their own — `+` joins (`kitchen+office`), `!` excludes (`!kitchen`) — so
+`-` never appears before a name at all, only before digits or doubled after one.
 
 Several devices can share the exact same literal Homey name (a common naming
 pattern, not a hypothetical — many houses have more than one "Ceiling Light").
@@ -147,7 +166,7 @@ same letters never competes. This is device-then-zone order only; there's no
 reverse form.
 
 A token that names a kind (`son`, `light`, `temp`) is parsed as the `thing`, not
-the `word`, whenever it appears in thing position — so `temp -bedroom 20` reads
+the `word`, whenever it appears in thing position — so `temp !bedroom 20` reads
 as the kind *every thermostat*, excluding the Bedroom's, with no separate `word`
 needed since the kind already names the one capability that kind controls.
 
@@ -286,7 +305,7 @@ Moods: Movie Night, Morning, Bedtime. One flow: Bedtime Routine.
 | `desk 40` | "Desk" matches only the Desk Lamp — dims it to 40% |
 | `living temp 21` | Living Room's thermostat target becomes 21° |
 | `kitchen+office light 20` | Kitchen and Office lights both dim to 20% — `word` is required since the Office also has a speaker |
-| `temp -bedroom 20` | Every thermostat except the Bedroom's is set to 20° |
+| `temp !bedroom 20` | Every thermostat except the Bedroom's is set to 20° |
 | `living light /2` | Living Room's lights halve from wherever they are, keeping the scene's shape rather than flattening it to one level — `word` is required here since the room also has a speaker and a thermostat |
 | `son grp living+office` | Groups the Living Room's and Office's Sonos speakers |
 | `front door unlock` | Unlocks the Front Door |
