@@ -282,12 +282,22 @@ export const devices = {
   "office-deskbacklight": light("office-deskbacklight", "Deskbacklight", "zone-office"),
 };
 
+// devices: a record keyed by device id, not an array — the vendored
+// package's own Mood schema (assets/specifications/HomeyAPIV3Local.json)
+// documents it as "keys are device IDs and values are objects containing
+// their state." An array here masked a real bug (index.mjs's foldUnderMood
+// doing `for...of mood.devices` — not iterable on a plain object) that no
+// test caught until it was confirmed live.
+function moodDeviceRecord(deviceIds) {
+  return Object.fromEntries(deviceIds.map((id) => [id, { state: {} }]));
+}
+
 export const moods = {
   "mood-movie-night": {
     id: "mood-movie-night",
     name: "Movie Night",
     preset: null,
-    devices: ["living-tv", "living-floor-lamp", "living-light-2", "living-speaker"],
+    devices: moodDeviceRecord(["living-tv", "living-floor-lamp", "living-light-2", "living-speaker"]),
     zone: "zone-living",
     uri: "homey:manager:moods",
   },
@@ -295,7 +305,7 @@ export const moods = {
     id: "mood-morning",
     name: "Morning",
     preset: null,
-    devices: ["bedroom-lamp"],
+    devices: moodDeviceRecord(["bedroom-lamp"]),
     zone: "zone-bedroom",
     uri: "homey:manager:moods",
   },
@@ -303,7 +313,7 @@ export const moods = {
     id: "mood-bedtime",
     name: "Bedtime",
     preset: null,
-    devices: ["living-tv", "living-speaker", "bedroom-lamp"],
+    devices: moodDeviceRecord(["living-tv", "living-speaker", "bedroom-lamp"]),
     zone: "zone-bedroom",
     uri: "homey:manager:moods",
   },

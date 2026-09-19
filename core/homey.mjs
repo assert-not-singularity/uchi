@@ -20,6 +20,16 @@ export async function getMoods(api) {
   return api.moods.getMoods();
 }
 
+// Verified against the vendored package's own specification
+// (assets/specifications/HomeyAPIV3Local.json's ManagerMoods.setMood: a
+// POST to /mood/:id/set, its one parameter "id" declared "in": "path") —
+// api.moods.setMood is generated generically from that spec by API.js,
+// which builds each operation's method to take an object keyed by its
+// declared parameter names, not a positional argument.
+export async function setMood(api, id) {
+  return api.moods.setMood({ id });
+}
+
 export async function getNotifications(api) {
   return api.notifications.getNotifications();
 }

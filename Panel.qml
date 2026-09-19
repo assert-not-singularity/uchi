@@ -190,7 +190,13 @@ Panel {
     // A "match" row can be a device or a zone candidate — both can share
     // the exact same name at once (a zone and a device both "Wohnzimmer"),
     // which is exactly the case an icon needs to disambiguate at a glance.
+    // A zone row carries its own deviceClass only when it's a capability-
+    // scoped batch/pending-scope summary (previewRowForBatch/pendingScope in
+    // grammar.mjs) — "the lights in Wohnzimmer," not the Wohnzimmer zone
+    // itself — so that takes priority over the house icon; a bare room
+    // query never sets deviceClass at all, and still gets the house icon.
     if (entry.kind === "match") {
+      if (row.deviceClass) return classIcon(row.deviceClass)
       return row.kind === "zone" ? "" /* home */ : classIcon(row.deviceClass)
     }
     return ""

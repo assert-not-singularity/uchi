@@ -53,6 +53,22 @@ export function appendNotification(entry) {
   return true;
 }
 
+// A mood activation, its own row kind — no from/to to fold on (append's own
+// dedupe there would reject it, since undefined === undefined), and no
+// natural id of its own (mints one, like append) since a mood can be
+// activated again with nothing distinguishing this run from the last.
+export function appendMood(entry) {
+  buffer.push({
+    id: nextId++,
+    ts: Date.now(),
+    kind: "mood",
+    ...entry,
+  });
+
+  if (buffer.length > MAX_ENTRIES) buffer.shift();
+  return true;
+}
+
 // Marks every id in `ids` as already seen, without appending a row — the
 // baseline the first notification poll establishes for "existed before the
 // core started."
