@@ -20,6 +20,12 @@ These apply to every task. They are deliberately short — this file is always i
   files compose), so the change lands where that responsibility already lives. Don't discover the
   shared shape by writing the same small check at each call site as you reach it — survey first,
   design once.
+- **Reflect before implementing.** Before writing new code for a need, pause and check: does an
+  existing function or module already do part of this, and where should the logic actually live so
+  every caller shares one implementation? Don't discover the answer by writing the same small piece
+  of logic at each call site as you happen to reach it — survey the callers first, then design the
+  shared shape once. The third copy of "if (x) row.field = x" is not a fix, it's the same mistake a
+  third time.
 - **Flag reusable logic.** When generic utility code (transforms, math helpers, shared parsing) is
   buried as a private method in one module, raise it: propose extracting it to a shared location
   so there is one source of truth.
