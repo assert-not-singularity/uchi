@@ -45,9 +45,11 @@ function capabilityRow(entry) {
     label: entry.deviceName,
     why,
     in: entry.cause === "prompt",
+    capabilityId: entry.capabilityId,
   };
 
   if (entry.zoneName) row.zone = entry.zoneName;
+  if (entry.deviceClass) row.deviceClass = entry.deviceClass;
 
   if (LINEABLE_CAPABILITIES.has(entry.capabilityId) && entry.from !== null && entry.from !== undefined) {
     row.line = lineFor(entry.deviceName, entry.capabilityId, entry.from);

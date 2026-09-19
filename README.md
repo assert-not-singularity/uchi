@@ -27,12 +27,31 @@ names a device or zone and, if it needs one, a verb or value:
   only, not `bin/uchi`) pins it as Here until another room is queried
 
 `↑`/`↓` moves the cursor over a candidate list when a line is ambiguous;
-`Enter` runs the highlighted line. Moods, flows, the `kind` grammar
-(`light`/`son`/`temp`), and chaining (`,`/`;`) are in `docs/design.md`'s
-grammar section as the target design — not implemented yet; phases 1–3 cover
-device/zone matching, the four verbs (`on`/`off`/`lock`/`unlock`), and the
-absolute/step/scale/notch value forms. The same lines work from a terminal
-via `bin/uchi <line>` — see below.
+`Enter` runs the highlighted line. The same lines work from a terminal via
+`bin/uchi <line>` — see below.
+
+### The full grammar
+
+```
+[thing[+thing…]] [!thing[+thing…]] [word] [value] [, segment…]
+
+thing    device name · zone name · mood · flow · kind (son=every Sonos,
+         light=every light, temp=every thermostat) · omitted = whole house
+word     capability: temp · light · vol
+         verb:       off on play pause next grp ungrp lock unlock
+value    absolute  40
+         step      +10  -10
+         scale     *2   /2      (levels only: dim, volume — clamps at 0/100)
+         notch     ++   --      (one fixed step per kind, from core config)
+chain    , or ;    a segment starting with a word inherits the previous subject
+?        lists the words that apply to the current match
+```
+
+This is the target design (`docs/design.md`'s full grammar section). What's actually built today is
+narrower: a single device or zone name, the four verbs (`on`/`off`/`lock`/`unlock`), and the four
+value forms (absolute/step/scale/notch) shown in the examples above. `+`/`!` joining and exclusion,
+chaining, `kind`/mood/flow as things, and every other word (`temp`/`light`/`vol`,
+`play`/`pause`/`next`/`grp`/`ungrp`) aren't implemented yet.
 
 ### How a line resolves
 
@@ -68,16 +87,16 @@ runs as `bin/uchi` from a checkout.
 
 ### Local development
 
-Quickshell's plugin loader rejects a `bar-widget` entry point reached through
-a symlinked plugin folder ("File name case mismatch" — misleading, but that's
-what it means; the `service` kind tolerates a symlink, `bar-widget` doesn't).
-`make dev-mount` bind-mounts this repo onto
-`~/.config/omarchy/plugins/uchi` so the loader sees a real directory while
-edits still land here; `make dev-unmount` reverses it. A bind mount doesn't
-survive a reboot — re-run `make dev-mount` after one.
+`make dev-deploy` copies this repo to `~/.config/omarchy/plugins/uchi` (a real
+copy, not a symlink or bind mount — Quickshell's plugin loader rejects a
+`bar-widget` entry point reached through either, with a misleading "File name
+case mismatch" error). Re-run it after every change you want to test; editing
+the repo itself has no effect on the running shell until you do.
 
-After editing QML, use `omarchy-restart-shell` (a full restart) — `omarchy-shell
-shell rescanPlugins` doesn't reliably pick up new files or QML changes.
+The shell watches that plugins directory and reloads on its own after a
+deploy that only edited existing files. After a deploy that adds a file or
+changes `manifest.json`, use `omarchy-restart-shell` (a full restart) instead
+— `omarchy-shell shell rescanPlugins` doesn't reliably pick up either.
 
 ## Testing
 

@@ -48,7 +48,19 @@ function renderDevice(device) {
   // deviceId/capabilityId (not just the `line`, which reflects the device's
   // *current* value) let a client build an "all off" loop over onoff-capable
   // rows without replaying an already-on row's line and leaving it on.
-  const base = { id: device.id, label: device.name, why, deviceId: device.id, capabilityId: pick.capabilityId };
+  // value/deviceClass are rendering hints only: a client needs the raw
+  // boolean to dim an off row, and Homey's own device.class (light, socket,
+  // thermostat, ...) to pick an icon — capabilityId alone can't tell a light
+  // from a socket, both commonly controlled via plain onoff.
+  const base = {
+    id: device.id,
+    label: device.name,
+    why,
+    deviceId: device.id,
+    capabilityId: pick.capabilityId,
+    value: pick.value,
+    deviceClass: device.class,
+  };
   return line ? { ...base, line } : base;
 }
 

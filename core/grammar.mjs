@@ -13,6 +13,12 @@ const VERB_WORDS = new Set(["on", "off", "lock", "unlock"]);
 // sizes by kind ("light", "vol", "temp"), not by raw capability name.
 const CAPABILITY_KIND = { dim: "light", volume_set: "vol", target_temperature: "temp" };
 
+// The inverse of CAPABILITY_KIND: design.md's capability word (light/vol/
+// temp), typed after a zone, to which Homey capability it disambiguates —
+// derived rather than hardcoded a second time, so the two mappings can
+// never drift apart.
+const WORD_CAPABILITY = Object.fromEntries(Object.entries(CAPABILITY_KIND).map(([capabilityId, word]) => [word, capabilityId]));
+
 // design.md's value grammar: absolute (40), step (+10/-10, relative to the
 // capability's current display value), scale (*2//2, levels only), notch
 // (++/--, one fixed per-kind step from core config). Sign disambiguation is
@@ -123,19 +129,46 @@ const MAX_AMBIGUOUS_MATCHES = 20;
 // qualifier is the only thing that can turn one of these into a fully
 // resolvable line, so the client reconstructs and re-runs one rather than
 // this function guessing which candidate was meant.
+// The one shape a "candidate the prompt can act on" row takes, wherever it's
+// built — an ambiguous pick, a dead end still needing more input, or a fully
+// resolved action still awaiting Enter. `kind` ("device" | "zone") lets a
+// client tell a device candidate from a zone candidate apart, since both can
+// share the exact same name; `deviceClass` is Homey's own device.class, the
+// only reliable way to pick an icon (capabilityId alone can't tell a light
+// from a socket, both commonly controlled via plain onoff).
+function candidateRow(label, why, { kind, zone, deviceClass, line } = {}) {
+  const row = { label, why };
+  if (kind) row.kind = kind;
+  if (zone) row.zone = zone;
+  if (deviceClass) row.deviceClass = deviceClass;
+  if (line) row.line = line;
+  return row;
+}
+
 function ambiguous(matches, zones, rest) {
   const result = {
-    matches: matches.slice(0, MAX_AMBIGUOUS_MATCHES).map((t) => {
-      const zoneName = t.kind === "device" ? zones[t.zone]?.name : undefined;
-      return zoneName ? { label: t.name, zone: zoneName, why: "ambiguous — pick one" } : { label: t.name, why: "ambiguous — pick one" };
-    }),
+    matches: matches.slice(0, MAX_AMBIGUOUS_MATCHES).map((t) => candidateRow(t.name, "ambiguous — pick one", {
+      kind: t.kind,
+      zone: t.kind === "device" ? zones[t.zone]?.name : undefined,
+      deviceClass: t.kind === "device" ? t.ref.class : undefined,
+    })),
   };
   if (rest) result.rest = rest;
   return result;
 }
 
-function deadEnd(label, why, zone) {
-  return { matches: [zone ? { label, why, zone } : { label, why }] };
+function deadEnd(label, why, zone, deviceClass, kind) {
+  return { matches: [candidateRow(label, why, { zone, deviceClass, kind })] };
+}
+
+// prompt.resolve's preview of an already-resolved action, before Enter runs
+// it — index.mjs's RPC handler is the only caller, since this is a rendering
+// concern of that one response, not something resolve()'s own return shape
+// (still needed raw by run()) should carry.
+export function previewRowForAction(action, devices, zones, line) {
+  const device = devices[action.deviceId];
+  const why = formatCapabilityWhy(action.capabilityId, action.value);
+  return candidateRow(device?.name, why, { zone: zones[device?.zone]?.name, deviceClass: device?.class, line });
 }
 
 // The one shared function for a capability's current-value description —
@@ -184,36 +217,19 @@ export function lineFor(deviceName, capabilityId, value) {
 // zone (not just the ambiguous list that came before it) — the zone that
 // distinguished this device a moment ago shouldn't vanish the instant it
 // resolves to one.
-function resolveDevice(device, rest, zones, notches) {
+// Applies a parsed value form to one device's already-known capability —
+// shared by a single device's own unique numeric target (resolveDevice) and
+// a zone+word batch (resolveZoneWord), where the capability comes from the
+// word instead and is applied to several devices, each stepping/scaling
+// from its own current value. Returns { value } on success, { why } (a
+// grammar.mjs dead-end reason, not thrown) when this device can't take it.
+function applyValue(device, capabilityId, parsed, notches) {
   const capsObj = device.capabilitiesObj ?? {};
-  const zoneName = zones[device.zone]?.name;
-
-  if (VERB_WORDS.has(rest.toLowerCase())) {
-    const word = rest.toLowerCase();
-    if ((word === "on" || word === "off") && capsObj.onoff?.setable) {
-      return { matches: [], action: { deviceId: device.id, capabilityId: "onoff", value: word === "on" } };
-    }
-    if ((word === "lock" || word === "unlock") && capsObj.locked?.setable) {
-      return { matches: [], action: { deviceId: device.id, capabilityId: "locked", value: word === "lock" } };
-    }
-    // Recognized word, unsupported by this device — falls through to the
-    // value step below, which rejects it as not a recognized value form.
-  }
-
-  if (rest === "") return deadEnd(device.name, "needs a verb or number", zoneName);
-
-  const parsed = parseValue(rest);
-  if (!parsed) return deadEnd(device.name, "needs a number", zoneName);
-
-  const setableNumeric = NUMERIC_TARGETS.filter((id) => capsObj[id]?.setable);
-  if (setableNumeric.length !== 1) return deadEnd(device.name, "needs a word", zoneName);
-
-  const capabilityId = setableNumeric[0];
   const isPercent = PERCENT_CAPABILITIES.has(capabilityId);
 
   // Scale is levels-only (dim, volume) per design.md — a thermostat has no
   // "half of 21 degrees" reading to scale.
-  if (parsed.kind === "scale" && !isPercent) return deadEnd(device.name, "needs a word", zoneName);
+  if (parsed.kind === "scale" && !isPercent) return { why: "needs a word" };
 
   const { min, max } = capsObj[capabilityId];
   const displayMin = isPercent ? toDisplayPercent(capabilityId, min) : min;
@@ -241,11 +257,96 @@ function resolveDevice(device, rest, zones, notches) {
   if (clamps) {
     displayValue = Math.max(displayMin, Math.min(displayMax, displayValue));
   } else if (displayValue < displayMin || displayValue > displayMax) {
-    return deadEnd(device.name, `needs ${displayMin}–${displayMax}`, zoneName);
+    return { why: `needs ${displayMin}–${displayMax}` };
   }
 
-  const value = isPercent ? toHomeyValue(capabilityId, displayValue) : displayValue;
-  return { matches: [], action: { deviceId: device.id, capabilityId, value } };
+  return { value: isPercent ? toHomeyValue(capabilityId, displayValue) : displayValue };
+}
+
+function resolveDevice(device, rest, zones, notches) {
+  const capsObj = device.capabilitiesObj ?? {};
+  const zoneName = zones[device.zone]?.name;
+
+  if (VERB_WORDS.has(rest.toLowerCase())) {
+    const word = rest.toLowerCase();
+    if ((word === "on" || word === "off") && capsObj.onoff?.setable) {
+      return { matches: [], action: { deviceId: device.id, capabilityId: "onoff", value: word === "on" } };
+    }
+    if ((word === "lock" || word === "unlock") && capsObj.locked?.setable) {
+      return { matches: [], action: { deviceId: device.id, capabilityId: "locked", value: word === "lock" } };
+    }
+    // Recognized word, unsupported by this device — falls through to the
+    // value step below, which rejects it as not a recognized value form.
+  }
+
+  if (rest === "") return deadEnd(device.name, "needs a verb or number", zoneName, device.class);
+
+  const parsed = parseValue(rest);
+  if (!parsed) return deadEnd(device.name, "needs a number", zoneName, device.class);
+
+  const setableNumeric = NUMERIC_TARGETS.filter((id) => capsObj[id]?.setable);
+  if (setableNumeric.length !== 1) return deadEnd(device.name, "needs a word", zoneName, device.class);
+
+  const capabilityId = setableNumeric[0];
+  const applied = applyValue(device, capabilityId, parsed, notches);
+  if (applied.why) return deadEnd(device.name, applied.why, zoneName, device.class);
+
+  return { matches: [], action: { deviceId: device.id, capabilityId, value: applied.value } };
+}
+
+// design.md's word list is 12 entries (3 capability words + 9 verbs), each
+// needing only its shortest unambiguous 2+ character prefix — but the 3
+// capability words alone (light/temp/vol) never collide at 2 characters
+// (li/te/vo), so prefix-matching only against these three, without the
+// verbs sharing word position, is unambiguous on its own. Extend this once
+// the verb words (grp/ungrp/etc.) also need word position.
+function matchWord(token) {
+  if (!token || token.length < 2) return null;
+  const lower = token.toLowerCase();
+  return Object.keys(WORD_CAPABILITY).find((word) => word.startsWith(lower)) ?? null;
+}
+
+// A zone with more than one controllable capability type needs a word to
+// say which one a trailing verb/value applies to (design.md's
+// `kitchen+office light 20` example, minus the "+office" join, deferred).
+// Every device in the zone with that capability gets it applied at once —
+// each stepping/scaling from its own current value, since "the kitchen's
+// lights" isn't one shared number. A device that can't take the given value
+// (out of its own range, on the absolute/step forms that dead-end rather
+// than clamp) is skipped rather than failing the whole batch — one device's
+// narrower range shouldn't block every other device the word matched.
+function resolveZoneWord(zoneThing, restTokens, devices, notches) {
+  const word = matchWord(restTokens[0]);
+  if (!word) return deadEnd(zoneThing.name, "needs a word", undefined, undefined, "zone");
+
+  const capabilityId = WORD_CAPABILITY[word];
+  const members = Object.values(devices).filter(
+    (d) => d.zone === zoneThing.id && d.capabilitiesObj?.[capabilityId]?.setable
+  );
+  if (members.length === 0) return deadEnd(zoneThing.name, `no ${word} here`, undefined, undefined, "zone");
+
+  const valueText = restTokens.slice(1).join(" ").trim();
+  if (valueText === "") return deadEnd(zoneThing.name, "needs a verb or number", undefined, undefined, "zone");
+
+  const lowerValue = valueText.toLowerCase();
+  if (lowerValue === "on" || lowerValue === "off") {
+    const actions = members
+      .filter((d) => d.capabilitiesObj?.onoff?.setable)
+      .map((d) => ({ deviceId: d.id, capabilityId: "onoff", value: lowerValue === "on" }));
+    if (actions.length === 0) return deadEnd(zoneThing.name, `no ${word} here`, undefined, undefined, "zone");
+    return { matches: [], actions };
+  }
+
+  const parsed = parseValue(valueText);
+  if (!parsed) return deadEnd(zoneThing.name, "needs a number", undefined, undefined, "zone");
+
+  const actions = [];
+  for (const device of members) {
+    const applied = applyValue(device, capabilityId, parsed, notches);
+    if (applied.value !== undefined) actions.push({ deviceId: device.id, capabilityId, value: applied.value });
+  }
+  if (actions.length === 0) return deadEnd(zoneThing.name, "needs a different value", undefined, undefined, "zone");
+  return { matches: [], actions };
 }
 
 // A trailing zone name is the only way to reach one specific device when
@@ -293,7 +394,7 @@ function narrowByZone(candidates, restTokens, zones, notches) {
   }
 
   const anyMatch = matchThing(restTokens, toZoneThings(Object.values(zones)));
-  if (anyMatch.matches.length === 1) return deadEnd(anyMatch.matches[0].name, "no match there");
+  if (anyMatch.matches.length === 1) return deadEnd(anyMatch.matches[0].name, "no match there", undefined, undefined, "zone");
 
   return null;
 }
@@ -328,9 +429,10 @@ export function resolve(text, { devices, zones, notches }) {
 
   if (thing.kind === "zone") {
     if (restText === "") return { matches: [], room: { id: thing.id, name: thing.name } };
-    // Words/kinds beyond a bare zone query are the full word grammar,
-    // deferred past this phase — a zone with anything after it is a dead end.
-    return deadEnd(thing.name, "needs a word");
+    // A bare `kind` thing with no zone at all (design.md's "light off" =
+    // every light in the house) and +/- zone joining/exclusion are deferred
+    // past this phase — resolveZoneWord only covers one zone at a time.
+    return resolveZoneWord(thing, rest, devices, notches);
   }
 
   return resolveDevice(thing.ref, restText, zones, notches);
@@ -351,6 +453,27 @@ export async function run(line, { devices, zones, setCapabilityValue, notches })
     } catch (err) {
       return { ok: false, error: err && err.message ? err.message : String(err) };
     }
+  }
+
+  if (result.actions) {
+    // Each device writes independently — one device rejecting (offline,
+    // Homey error) shouldn't undo or block the others a zone+word batch
+    // already resolved to a value for. A partial failure still reports
+    // `ok: true` (the devices that did apply really did change), but
+    // carries `failed` so the caller can tell a clean success from a batch
+    // where some devices were silently skipped, rather than losing the
+    // rejected ones' errors entirely.
+    const settled = await Promise.allSettled(
+      result.actions.map((a) => setCapabilityValue(devices[a.deviceId], a.capabilityId, a.value))
+    );
+    const changes = settled.filter((s) => s.status === "fulfilled").map((s) => s.value);
+    const failed = settled
+      .filter((s) => s.status === "rejected")
+      .map((s) => (s.reason && s.reason.message ? s.reason.message : String(s.reason)));
+    if (changes.length === 0) {
+      return { ok: false, error: failed[0] ?? "all writes failed" };
+    }
+    return failed.length > 0 ? { ok: true, changes, failed } : { ok: true, changes };
   }
 
   if (result.room) return { ok: false, room: result.room };
