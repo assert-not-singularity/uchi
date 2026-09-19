@@ -33,6 +33,11 @@ Panel {
   property string promptText: ""
   property var candidateMatches: []
   property var candidateRoom: null
+  // Whatever of the prompt an ambiguous match couldn't apply (core/
+  // grammar.mjs's `rest`) — needed to reconstruct "<label> <zone> <rest>"
+  // when a candidate with no `line` of its own (still ambiguous) gets
+  // selected; see activateCursor.
+  property string candidateRest: ""
   readonly property bool showingCandidates: promptText.length > 0
 
   function refreshCandidates() {
@@ -40,6 +45,7 @@ Panel {
     if (!uchi || requestText.length === 0) {
       root.candidateMatches = []
       root.candidateRoom = null
+      root.candidateRest = ""
       root.cursorIndex = 0
       return
     }
@@ -48,6 +54,7 @@ Panel {
       var result = message && message.result ? message.result : {}
       root.candidateRoom = result.room || null
       root.candidateMatches = result.matches || []
+      root.candidateRest = result.rest || ""
       root.cursorIndex = 0
     })
   }
@@ -101,8 +108,22 @@ Panel {
       return
     }
     var row = entry.row
-    if (row && row.line) {
+    if (!row) return
+    if (row.line) {
       uchi.run(row.line, function(message) {
+        if (message && message.result && message.result.ok) root.promptText = ""
+      })
+      return
+    }
+    // Still ambiguous (no line of its own — there's no single valid
+    // grammar line for "the ambiguous set"). The zone qualifier is the
+    // only thing that can turn this specific candidate into a resolvable
+    // line, so reconstruct "<label> <zone> <rest>" and run that instead of
+    // doing nothing. A candidate with no zone (e.g. the rare zone-vs-device
+    // name tie) can't be qualified this way and stays inert.
+    if (row.zone) {
+      var qualifiedLine = row.label + " " + row.zone + (root.candidateRest ? " " + root.candidateRest : "")
+      uchi.run(qualifiedLine, function(message) {
         if (message && message.result && message.result.ok) root.promptText = ""
       })
     }
@@ -121,15 +142,17 @@ Panel {
     return String(text ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
-  // Rich-text markup, not a plain string: Recent spans multiple rooms at
-  // once (unlike Hero/Here, already grouped under a room's own section
-  // header), so its rows get a dimmed "(zone)" suffix the other kinds don't.
+  // Rich-text markup, not a plain string: any row carrying a `.zone` field
+  // (Recent, an ambiguous match, a dead end) gets the same dimmed suffix —
+  // one style for every kind, not a per-kind rule. Hero/Here rows never
+  // carry `.zone` (they're already grouped under a room's own section
+  // header, so it'd be redundant), so this never fires for them.
   function rowMarkup(entry) {
     if (entry.kind === "room") return escapeMarkup(entry.room.name)
     var row = entry.row
     if (!row) return ""
     var text = escapeMarkup(row.label)
-    if (entry.kind === "recent" && row.zone) {
+    if (row.zone) {
       text += " <font color=\"" + Color.muted + "\">" + escapeMarkup(row.zone) + "</font>"
     }
     // A transition's own "→ ..." already reads as a separator — stacking

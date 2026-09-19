@@ -23,6 +23,21 @@ const IDLE_EXIT_MS = 60_000;
 const NOTIFICATION_POLL_MS = 30_000;
 const NOTIFICATION_RETRY_MS = 5_000;
 const SELF_WRITE_ECHO_TIMEOUT_MS = 5_000;
+// A flow/mood setting both onoff and a numeric target (dim, say) on one
+// device issues them as two separate capability writes — neither is our own
+// write, so pendingSelfWrites never sees either. This window is how close
+// together they have to arrive to fold into the numeric-target row alone;
+// not independently confirmed against a live flow's actual timing, just
+// wide enough to cover the two-events-in-quick-succession pattern observed.
+const ONOFF_FOLD_WINDOW_MS = 500;
+// A smooth-transition ramp (a scene fading a light over a few seconds, say)
+// sends several intermediate numeric-target values, each its own external
+// change — reset on every new value, so only the level it settles on after
+// this long a quiet gap becomes a Recent row. Matches
+// SELF_WRITE_ECHO_TIMEOUT_MS's existing 5s; Recent isn't the primary
+// feedback loop (the device itself changes in real time), so the row
+// appearing a few seconds late costs nothing real.
+const DIM_TRANSITION_DEBOUNCE_MS = 5_000;
 
 function socketPathFromEnv() {
   const runtimeDir = process.env.XDG_RUNTIME_DIR;
@@ -160,6 +175,41 @@ async function main() {
     return null;
   }
 
+  function deviceHasNumericTarget(deviceId) {
+    const capsObj = devices[deviceId]?.capabilitiesObj ?? {};
+    return NUMERIC_TARGETS.some((id) => capsObj[id] !== undefined);
+  }
+
+  // deviceId -> { onoffChange, numericChange, timer }, for any device with
+  // a numeric target capability at all — a plain onoff-only device (a
+  // socket, a lock) can never produce either pattern this folds and logs
+  // immediately instead. Two things settle here before becoming a Recent
+  // row: onoff and a numeric target (dim, say) arriving as two separate
+  // external changes for one action (resolved within the short
+  // ONOFF_FOLD_WINDOW_MS — the light turning on/off is what happened; the
+  // specific level it landed on is incidental, so onoff always wins over a
+  // coincident numeric change), and a smooth-transition ramp sending many
+  // intermediate numeric-target values in quick succession, which debounces
+  // over the longer DIM_TRANSITION_DEBOUNCE_MS instead — reset on every new
+  // value — so only the final settled level logs, not each step.
+  const pendingDeviceChange = new Map();
+
+  function logCapabilityChange({ deviceId, capabilityId, from, to }) {
+    const deviceName = devices[deviceId]?.name ?? startupDeviceNames.get(deviceId);
+    const zoneName = zones[devices[deviceId]?.zone]?.name;
+    if (log.append({ deviceId, deviceName, zoneName, capabilityId, from, to, cause: null })) notifyChanged();
+  }
+
+  function scheduleDeviceChangeDecision(deviceId, delayMs) {
+    const pending = pendingDeviceChange.get(deviceId);
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => {
+      pendingDeviceChange.delete(deviceId);
+      const change = pending.onoffChange ?? pending.numericChange;
+      logCapabilityChange({ deviceId, capabilityId: change.capabilityId, from: change.from, to: change.to });
+    }, delayMs);
+  }
+
   function onChange({ deviceId, capabilityId, value }) {
     const key = keyFor(deviceId, capabilityId);
     const from = currentValue.get(key);
@@ -179,9 +229,32 @@ async function main() {
 
     if (groupIdForMember(deviceId)) return;
 
-    const deviceName = devices[deviceId]?.name ?? startupDeviceNames.get(deviceId);
-    const zoneName = zones[devices[deviceId]?.zone]?.name;
-    if (log.append({ deviceId, deviceName, zoneName, capabilityId, from, to: value, cause: null })) notifyChanged();
+    const isFoldable = capabilityId === "onoff" || NUMERIC_TARGETS.includes(capabilityId);
+    if (isFoldable && deviceHasNumericTarget(deviceId)) {
+      const pending = pendingDeviceChange.get(deviceId) ?? { onoffChange: null, numericChange: null, timer: null };
+      pendingDeviceChange.set(deviceId, pending);
+      if (capabilityId === "onoff") {
+        // A second onoff transition arriving before the first was decided
+        // is an independent toggle, not a pair to fold with a numeric
+        // change — flush the first now rather than losing it to this
+        // overwrite (this device could otherwise be flipped on/off/on in
+        // quick succession and only the last transition would ever log).
+        if (pending.onoffChange) logCapabilityChange({ deviceId, ...pending.onoffChange });
+        pending.onoffChange = { capabilityId, from, to: value };
+      } else {
+        // Preserves the ramp's true starting value, not just its
+        // second-to-last step — a Recent row's undo `line` targets `from`,
+        // and only the debounce's final event ever becomes a row.
+        const startFrom = pending.numericChange && pending.numericChange.capabilityId === capabilityId
+          ? pending.numericChange.from
+          : from;
+        pending.numericChange = { capabilityId, from: startFrom, to: value };
+      }
+      scheduleDeviceChangeDecision(deviceId, pending.onoffChange ? ONOFF_FOLD_WINDOW_MS : DIM_TRANSITION_DEBOUNCE_MS);
+      return;
+    }
+
+    logCapabilityChange({ deviceId, capabilityId, from, to: value });
   }
 
   subscribeToDiscreteChanges(devices, onChange);
@@ -371,7 +444,7 @@ async function main() {
     },
 
     "prompt.resolve": async (params) => {
-      const result = resolve(params.text ?? "", { devices, zones });
+      const result = resolve(params.text ?? "", { devices, zones, notches: coreConfig.notches });
 
       if (result.room) return { matches: [], room: result.room };
 
@@ -381,11 +454,11 @@ async function main() {
         return { matches: [{ label, line: params.text, why }] };
       }
 
-      return { matches: result.matches };
+      return result.rest ? { matches: result.matches, rest: result.rest } : { matches: result.matches };
     },
 
     "prompt.run": async (params) => {
-      const result = await run(params.line ?? "", { devices, zones, setCapabilityValue: write });
+      const result = await run(params.line ?? "", { devices, zones, setCapabilityValue: write, notches: coreConfig.notches });
       if (result.ok) {
         if (log.append({ ...result.change, cause: "prompt" })) notifyChanged();
         return { ok: true };

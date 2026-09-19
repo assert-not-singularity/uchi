@@ -77,8 +77,14 @@ BarWidget {
   function close() { if (panelLoader.item) panelLoader.item.close() }
   function toggle() { if (panelLoader.item) panelLoader.item.toggle() }
 
-  // Clears "active" back to "idle" on every open, IPC-triggered or clicked.
+  // Clears "active" back to "idle" on every open, IPC-triggered or clicked
+  // — and keeps clearing it continuously while the panel stays open, not
+  // just at the moment it opens: an action taken while already looking at
+  // an open panel produces a new Recent row too, and it shouldn't read as
+  // "unseen" just because it arrived a moment after open() rather than
+  // before it.
   onOpenedChanged: if (root.opened) root.highestSeenTs = root.newestRecentTs
+  onNewestRecentTsChanged: if (root.opened) root.highestSeenTs = root.newestRecentTs
 
   onUchiChanged: { syncMachineRoom(); syncIpcHooks(); injectPanel() }
   onMachineRoomSettingChanged: syncMachineRoom()

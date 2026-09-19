@@ -79,10 +79,12 @@ isn't representative of anything official and isn't used as a reference below:
 
 **Scope gaps carried into this phase, flagged rather than silently resolved:**
 
-- `h`/`l` (step a row's capability by one notch) and the `++`/`--` notch value form have no
-  grammar support (still deferred, no phase attached). Wire the keys but have them no-op with a
-  console warning rather than send `grammar.mjs` a line it can't parse — do **not** implement
-  notch parsing here just to make the key do something.
+- `h`/`l` (step the highlighted row's capability by one notch, without typing) has no key bound to
+  it at all — consistent with this phase's later decision to remove every keyboard shortcut beyond
+  typing/navigation/Enter (see "Post-launch refinements" below). The underlying `++`/`--` notch
+  *value form* this key would have sent is a separate thing and **is** implemented (see the value
+  grammar entry below) — typing `desk ++` directly into the prompt works; there's just no
+  single-key shortcut for it.
 - `a` (all off) has no named protocol method anywhere in `design.md`, and can't be built
   client-side from the existing row shape either: a Here/Hero device row is `{ id, label, why,
   line? }` — it doesn't expose which capability `line` targets or the device's raw `onoff`
@@ -375,15 +377,110 @@ anticipated above:
   outside the card border rather than being cut off or scrollable. `bodyColumn` is now wrapped in
   a `Flickable` (`clip: true`, `boundsBehavior: Flickable.StopAtBounds`), the same fix
   `omarchy.clock`'s own calendar content already uses for the same reason.
+- **An externally triggered onoff+dim pair still doubled up.** The earlier `pendingSelfWrites`
+  fix only covers *our own* writes cascading `dim`→`onoff` — it has nothing to do with a flow or
+  the Homey app setting both `onoff` and a numeric target on one device as two separate external
+  capability changes, arriving close together in either order (observed both ways: onoff-then-dim
+  turning a light on to a level, dim-then-onoff turning it off). Neither event is a self-write
+  echo, so `pendingSelfWrites` never sees either side. `onChange` now holds both in a per-device
+  `pendingDeviceChange` record (for any device that actually has a numeric target capability — a
+  plain onoff-only device, a socket or a lock, can't produce this pattern and logs immediately,
+  unaffected) and decides once things settle, by transition rather than arrival order: an `onoff`
+  change always wins over a coincident numeric-target one — the light turning on or off is what
+  happened, the specific level it landed on is incidental — and only a numeric-target change with
+  no accompanying `onoff` change logs its own level (already on, brightness adjusted). `onoff`
+  resolves within the short `ONOFF_FOLD_WINDOW_MS` (500ms); see the next entry for why a
+  numeric-target-only change waits longer.
+- **A smooth-transition ramp logged every intermediate step.** A scene/flow fading a light over a
+  few seconds sends several intermediate numeric-target values as separate external changes, each
+  logging its own row. `pendingDeviceChange`'s numeric-only path (see above) now debounces over
+  `DIM_TRANSITION_DEBOUNCE_MS` (5s, matching the existing `SELF_WRITE_ECHO_TIMEOUT_MS` — Recent
+  isn't the primary feedback loop, so a row landing a few seconds late costs nothing real),
+  reset on every new value so only the level it settles on after that long a quiet gap becomes a
+  row. The debounced record keeps the *first* value in the burst as `from` (not the second-to-last
+  step), since that's what the row's undo `line` targets.
+- **Zone-qualified device disambiguation, previously flagged as out of scope, is now built.** The
+  grammar had no way to reach one specific device when several share the exact same literal Homey
+  name — a real, common naming pattern (this house has three devices literally named
+  "Deckenleuchte", across Küche/Badezimmer/Flur), not a hypothetical, and one no amount of typing
+  more of the name could ever resolve. `grammar.mjs`'s `resolve()` now tries a trailing zone name
+  against an ambiguous device set's own zones — `resolveDevice()` is split out of `resolve()` so
+  both the ordinary single-match path and this new `narrowByZone()` path reach the same word/value
+  logic. Matched only against the zones the ambiguous candidates actually span, not every zone in
+  the house: confirmed live that "decken fl" must narrow to Flur among {Küche, Badezimmer, Flur,
+  Schlafzimmer} even though "fl" is also a substring of "Pflanzen," a zone none of these candidates
+  are even in and so was never a real competing interpretation. Falls back to checking the whole
+  house's zones only to return a clean "no match there" when the trailing text names a real zone
+  that just isn't one of the candidates', rather than silently doing nothing; falls back further to
+  the plain unqualified ambiguous list when the trailing text isn't a zone at all. Word/value
+  semantics never apply to a still-ambiguous set in the existing grammar, so there's no case where
+  the trailing text could mean something *other* than a zone qualifier once ambiguous — no new
+  parse conflict to resolve. Order is device-then-zone only; no reverse form.
+- **A match's zone was baked into `label` as plain "(Zone)" text, inconsistent with Recent's own
+  dimmed zone suffix — and a resolved single device's dead end dropped the zone entirely, right
+  when it stopped needing to distinguish anything.** `qualifyLabel` (now removed) built the label
+  string itself; `ambiguous()` returns a separate `zone` field instead — the same field shape
+  Recent rows already carry — and `deadEnd()` takes an optional `zone` argument, which
+  `resolveDevice()` now always passes (the device's own zone, looked up via the `zones` parameter
+  it gained). `Panel.qml`'s `rowMarkup()` renders the dimmed suffix for *any* row carrying `.zone`,
+  not `entry.kind === "recent"` specifically — one style for every row kind, not a per-kind rule
+  (Hero/Here rows never carry `.zone` at all, so this never fires for them, unaffected).
+- **An ambiguous candidate had no `line`, so selecting one via arrow keys + Enter did nothing at
+  all.** This was never actually working, not a regression from removing `Tab` — an ambiguous row
+  never carried a `line` in the first place, since there's no single valid grammar line for "the
+  ambiguous set." `ambiguous()` now also echoes back `rest` — whatever of the input the tie
+  couldn't apply (a trailing word/value) — so `Panel.qml`'s `activateCursor()` can reconstruct
+  `"<label> <zone> <rest>"` for the selected candidate and run that, reusing the same
+  zone-qualification this phase already added rather than inventing a bypass around `prompt.run`.
+  A candidate with no zone (the rare zone-vs-device name tie) can't be qualified this way and
+  stays inert, same as before.
+- **Two further zone-narrowing bugs, found only by testing the reconstructed-line path against a
+  real house:** (1) Homey's own stored device names aren't consistently trimmed — two of three
+  otherwise identically named "Deckenleuchte"s had a trailing space, one didn't, so typing the
+  name exactly resolved to the space-free one *alone* instead of tying all three, silently
+  skipping zone-narrowing altogether. `things()` now trims both device and zone names once, the
+  single place everything else in this file derives `name` from. (2) A leftover word (`on`, `off`)
+  could coincidentally substring-match an unrelated real zone (`"on"` inside `"Nutzerkonten"`),
+  hijacking an entire ambiguous list into one bogus "no match in Nutzerkonten" row — fixed by
+  having `narrowByZone` skip zone-narrowing entirely whenever the leftover text starts with a
+  recognized verb word, rather than narrowing what counts as a zone match to dodge the collision.
+- **The bar pill read "active" after an action taken while the panel was already open.**
+  `BarWidget.qml`'s "seen" watermark only updated at the moment the panel opened
+  (`onOpenedChanged`), not while it stayed open — so a Recent row produced by the person's own
+  action, while they were looking straight at the panel, still counted as "unseen since last
+  open" until they closed and reopened it. `onNewestRecentTsChanged` now updates the watermark too,
+  whenever the panel is currently open, not just at the instant it opens.
+- **The value grammar's step/scale/notch forms were never implemented — and `+10` wasn't just
+  missing, it was silently wrong.** `Number("+10")` parses fine as plain `10`, so `desk +10` set
+  Desk Lamp to a 10% *absolute* level instead of stepping up from wherever it was — it looked like
+  it worked. `parseValue()` now distinguishes all four value forms design.md's grammar table
+  specifies: absolute (`40`, unchanged), step (`+10`/`-10`, relative to the capability's current
+  display value), scale (`*2`/`/2`, levels only — dim/volume, not target_temperature, which has no
+  "half of 21 degrees" reading — clamping at the capability's min/max per design.md rather than
+  dead-ending), and notch (`++`/`--`, one fixed per-kind step read from `resolve()`/`run()`'s new
+  `notches` parameter, threaded from `core/index.mjs`'s `coreConfig.notches`, also clamping).
+  Absolute and step still dead-end on out-of-range, matching existing behavior exactly. This is
+  the value grammar only — the `h`/`l` keyboard shortcut that would trigger a notch without typing
+  stays unbound, per this phase's separate decision to remove every shortcut beyond
+  typing/navigation/Enter.
+- **Two Copilot-review findings on the value grammar and onoff/numeric fold, both real.** `/0`
+  matched the scale form (`\d+` accepts a lone `0`) and divided to `Infinity`, which the clamp then
+  silently turned into a write at the capability's maximum — `parseValue()` now rejects a zero
+  divisor outright rather than letting the clamp mask it. Separately, `onChange`'s onoff+numeric
+  fold unconditionally overwrote `pending.onoffChange` on every `onoff` event, so a device flipped
+  on/off/on in quick succession (no numeric event involved at all) silently lost every transition
+  but the last — the pending fold is meant for one onoff+numeric *pair*, not for coalescing
+  independent toggles. A second `onoff` event now flushes whatever was already pending as its own
+  Recent row before starting a fresh pending record, so distinct toggles are never dropped.
 
 ## After this phase
 
-Phase 4 (Attention) is the first real consumer of the `x`/`s` keys and `row.dismiss`/
-`row.snooze`/`row.mute` — those RPC methods get added then, against real rows, not speculatively
-here. Phase 5 (Habits) is the same story for whatever's left of `x`. The notch/word grammar gap
-(`h`/`l`, `++`/`--`) has no phase attached in `phase-2-plan.md`'s deferred list; whichever phase
-picks it up should also flip `h`/`l` here from inert to real, since the panel-side wiring already
-exists.
+Phase 4 (Attention) is the first real consumer of `row.dismiss`/`row.snooze`/`row.mute` — those
+RPC methods get added then, against real rows, not speculatively here. Phase 5 (Habits) is the
+same story for whatever muting it needs. Every keyboard shortcut beyond typing/navigation/Enter
+was removed this phase for safety (see "Post-launch refinements"), including `x`/`s` and `h`/`l` —
+whichever phase revisits shortcuts should design them with real per-device judgment from the
+start, not rebuild the blanket versions this phase shipped and then removed.
 
 ## Implementation approach
 
