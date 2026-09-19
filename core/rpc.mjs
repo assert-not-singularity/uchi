@@ -8,8 +8,7 @@ import { EventEmitter } from "node:events";
 // Homey connection. No single-instance logic lives here: `flock(1)` (see
 // Service.qml) already guarantees exactly one core process is ever running
 // before this code executes, so listen() unconditionally unlinks any
-// pre-existing socket file and binds — see docs/phase-1-plan.md for why a
-// PID-file-based guard was rejected instead.
+// pre-existing socket file and binds.
 export function createRpcServer({ methods }) {
   const emitter = new EventEmitter();
   const sockets = new Set();

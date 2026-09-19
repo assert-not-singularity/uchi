@@ -16,7 +16,7 @@ Panel {
   property var uchi: null
   property var anchorItem: null
   // The bar's popout coordinator tracks the widget mounted in its slot
-  // (BarWidget.qml), not this nested panel — see docs/phase-3-plan.md.
+  // (BarWidget.qml), not this nested panel.
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
@@ -200,7 +200,8 @@ Panel {
         // No single-letter hotkeys reserved at all, "a" included: any of
         // them blocks typing a real device/zone name starting with that
         // letter ("Anrichte", "Arbeitszimmer", ...) for a shortcut that
-        // isn't essential. See docs/phase-3-plan.md's scope gaps.
+        // isn't essential — see docs/design.md's "Explicitly decided
+        // against" for the all-off shortcut specifically.
         if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127
             && (event.modifiers === Qt.NoModifier || event.modifiers === Qt.ShiftModifier)) {
           root.promptText += event.text
