@@ -9,6 +9,7 @@ import {
   getNotifications,
   subscribeToDiscreteChanges,
   setCapabilityValue,
+  setMood,
   DISCRETE_CAPABILITIES,
   GROUP_DRIVER_ID,
   NUMERIC_TARGETS,
@@ -17,7 +18,7 @@ import { createRpcServer } from "./rpc.mjs";
 import * as log from "./log.mjs";
 import * as recent from "./recent.mjs";
 import * as here from "./here.mjs";
-import { resolve, run, previewRowForAction } from "./grammar.mjs";
+import { resolve, run, previewRowForAction, previewRowForBatch, previewRowForPendingMember } from "./grammar.mjs";
 
 const IDLE_EXIT_MS = 60_000;
 const NOTIFICATION_POLL_MS = 30_000;
@@ -38,6 +39,11 @@ const ONOFF_FOLD_WINDOW_MS = 500;
 // feedback loop (the device itself changes in real time), so the row
 // appearing a few seconds late costs nothing real.
 const DIM_TRANSITION_DEBOUNCE_MS = 5_000;
+// design.md's Recent section: "changes within 2s of a mood/flow fold under
+// it" — a mood's own Recent row already represents what it did; a separate
+// row per device it touched would be the same noise groupIdForMember
+// already avoids for a Homey Group's members.
+const MOOD_FOLD_WINDOW_MS = 2_000;
 
 function socketPathFromEnv() {
   const runtimeDir = process.env.XDG_RUNTIME_DIR;
@@ -175,6 +181,24 @@ async function main() {
     return null;
   }
 
+  // deviceId -> the timer suppressing its own Recent row, for
+  // MOOD_FOLD_WINDOW_MS after a mood activation that names it — Homey's own
+  // mood object already lists exactly which devices it touches, so this
+  // doesn't need groupIdForMember's live scan, just that list at the moment
+  // of activation. `mood.devices` is a record keyed by device id (per the
+  // vendored spec's own Mood schema), not an array — confirmed live: the
+  // original `for (const deviceId of mood.devices ?? [])` threw "object is
+  // not iterable" on every real mood activation, since a plain object isn't
+  // iterable with for...of.
+  const pendingMoodDeviceIds = new Map();
+
+  function foldUnderMood(mood) {
+    for (const deviceId of Object.keys(mood.devices ?? {})) {
+      clearTimeout(pendingMoodDeviceIds.get(deviceId));
+      pendingMoodDeviceIds.set(deviceId, setTimeout(() => pendingMoodDeviceIds.delete(deviceId), MOOD_FOLD_WINDOW_MS));
+    }
+  }
+
   function deviceHasNumericTarget(deviceId) {
     const capsObj = devices[deviceId]?.capabilitiesObj ?? {};
     return NUMERIC_TARGETS.some((id) => capsObj[id] !== undefined);
@@ -229,6 +253,7 @@ async function main() {
     if ((capabilityId === "alarm_contact" || capabilityId === "alarm_motion") && value !== true) return;
 
     if (groupIdForMember(deviceId)) return;
+    if (pendingMoodDeviceIds.has(deviceId)) return;
 
     const isFoldable = capabilityId === "onoff" || NUMERIC_TARGETS.includes(capabilityId);
     if (isFoldable && deviceHasNumericTarget(deviceId)) {
@@ -259,6 +284,16 @@ async function main() {
   }
 
   subscribeToDiscreteChanges(devices, onChange);
+
+  // Registers the fold *before* the write, not after — a mood's own device
+  // changes can arrive within milliseconds, and folding them only after
+  // setMood's promise resolves would miss whichever ones already landed.
+  async function activateMoodAndLog(id) {
+    const mood = moods[id];
+    if (mood) foldUnderMood(mood);
+    await setMood(api, id);
+    if (mood && log.appendMood({ moodId: mood.id, moodName: mood.name, cause: "prompt" })) notifyChanged();
+  }
 
   // One promise chain per key so two quick writes to the same capability
   // can't interleave or both capture the same stale `from`.
@@ -453,24 +488,55 @@ async function main() {
     },
 
     "prompt.resolve": async (params) => {
-      const result = resolve(params.text ?? "", { devices, zones, notches: coreConfig.notches });
+      const result = resolve(params.text ?? "", { devices, zones, notches: coreConfig.notches, moods });
 
       if (result.room) return { matches: [], room: result.room };
+
+      if (result.mood) {
+        return { matches: [{ label: result.mood.name, why: "mood", kind: "mood", line: params.text }] };
+      }
 
       if (result.action) {
         return { matches: [previewRowForAction(result.action, devices, zones, params.text)] };
       }
 
       if (result.actions) {
-        return { matches: result.actions.map((a) => previewRowForAction(a, devices, zones, params.text)) };
+        const rows = result.actions.map((a) => previewRowForAction(a, devices, zones, params.text));
+        // A single-device batch has nothing a separate summary row would
+        // add over that one row — only worth prepending once there's an
+        // actual "all of these at once" to summarize.
+        if (result.scopeLabel && result.actions.length > 1) {
+          rows.unshift(previewRowForBatch(result.scopeLabel, result.scopeWord, result.actions, devices, zones, params.text));
+        }
+        return { matches: rows };
       }
+
+      // A pendingScope reading (resolve()'s own matches[0] is already its
+      // summary row) — same per-member breakdown a completed batch gets,
+      // one step earlier, once there's more than one device to break down.
+      if (result.memberIds && result.memberIds.length > 1) {
+        const rows = result.memberIds.map((id) => previewRowForPendingMember(id, devices, zones));
+        return { matches: [...result.matches, ...rows] };
+      }
+
+      if (result.words) return { matches: [], words: result.words };
 
       return result.rest ? { matches: result.matches, rest: result.rest } : { matches: result.matches };
     },
 
     "prompt.run": async (params) => {
-      const result = await run(params.line ?? "", { devices, zones, setCapabilityValue: write, notches: coreConfig.notches });
+      const result = await run(params.line ?? "", {
+        devices,
+        zones,
+        moods,
+        setCapabilityValue: write,
+        activateMood: activateMoodAndLog,
+        notches: coreConfig.notches,
+      });
       if (result.ok) {
+        // activateMoodAndLog already logged the mood's own row (and
+        // notified) as part of running it — nothing left to log here.
+        if (result.mood) return { ok: true };
         const changes = result.changes ?? [result.change];
         let changed = false;
         for (const change of changes) {

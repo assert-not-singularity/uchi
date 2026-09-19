@@ -33,6 +33,11 @@ Panel {
   property string promptText: ""
   property var candidateMatches: []
   property var candidateRoom: null
+  // core/grammar.mjs's `?` result — { label, list } for the single device
+  // "<label>?" resolved to, `list` the words that apply to it. Mutually
+  // exclusive with candidateRoom/candidateMatches: a trailing "?" is its
+  // own branch in resolve(), never combined with an ordinary match.
+  property var candidateWords: null
   // Whatever of the prompt an ambiguous match couldn't apply (core/
   // grammar.mjs's `rest`) — needed to reconstruct "<label> <zone> <rest>"
   // when a candidate with no `line` of its own (still ambiguous) gets
@@ -45,6 +50,7 @@ Panel {
     if (!uchi || requestText.length === 0) {
       root.candidateMatches = []
       root.candidateRoom = null
+      root.candidateWords = null
       root.candidateRest = ""
       root.cursorIndex = 0
       return
@@ -53,6 +59,7 @@ Panel {
       if (requestText !== root.promptText) return // stale — prompt moved on
       var result = message && message.result ? message.result : {}
       root.candidateRoom = result.room || null
+      root.candidateWords = result.words || null
       root.candidateMatches = result.matches || []
       root.candidateRest = result.rest || ""
       root.cursorIndex = 0
@@ -67,6 +74,13 @@ Panel {
   readonly property var activeRows: {
     if (root.showingCandidates) {
       if (root.candidateRoom) return [{ kind: "room", room: root.candidateRoom }]
+      if (root.candidateWords) {
+        var wordRows = []
+        for (var w = 0; w < root.candidateWords.list.length; w++) {
+          wordRows.push({ kind: "word", word: root.candidateWords.list[w] })
+        }
+        return wordRows
+      }
       var matchRows = []
       for (var m = 0; m < root.candidateMatches.length; m++) matchRows.push({ kind: "match", row: root.candidateMatches[m] })
       return matchRows
@@ -154,6 +168,7 @@ Panel {
     if (kind === "here") return root.hereRoom ? root.hereRoom.name + " (Here)" : "Here"
     if (kind === "match") return "Matches"
     if (kind === "room") return "Room"
+    if (kind === "word") return root.candidateWords ? root.candidateWords.label : "Words"
     return ""
   }
 
@@ -181,6 +196,7 @@ Panel {
   }
 
   function rowIcon(entry) {
+    if (entry.kind === "word") return "" // a plain word label, not a device/zone
     var row = entry.row
     if (!row) return ""
     if (entry.kind === "recent" && row.kind === "notification") return "" // bell
@@ -190,7 +206,13 @@ Panel {
     // A "match" row can be a device or a zone candidate — both can share
     // the exact same name at once (a zone and a device both "Wohnzimmer"),
     // which is exactly the case an icon needs to disambiguate at a glance.
+    // A zone row carries its own deviceClass only when it's a capability-
+    // scoped batch/pending-scope summary (previewRowForBatch/pendingScope in
+    // grammar.mjs) — "the lights in Wohnzimmer," not the Wohnzimmer zone
+    // itself — so that takes priority over the house icon; a bare room
+    // query never sets deviceClass at all, and still gets the house icon.
     if (entry.kind === "match") {
+      if (row.deviceClass) return classIcon(row.deviceClass)
       return row.kind === "zone" ? "" /* home */ : classIcon(row.deviceClass)
     }
     return ""
@@ -245,6 +267,7 @@ Panel {
   // header, so it'd be redundant), so this never fires for them.
   function rowMarkup(entry) {
     if (entry.kind === "room") return escapeMarkup(entry.room.name)
+    if (entry.kind === "word") return escapeMarkup(entry.word)
     var row = entry.row
     if (!row) return ""
     var icon = rowIcon(entry)

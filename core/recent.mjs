@@ -62,6 +62,12 @@ function notificationRow(entry) {
   return { id: entry.id, ts: entry.ts, kind: "notification", label: entry.ownerName, why: entry.excerpt, in: false };
 }
 
+function moodRow(entry) {
+  let why = "mood";
+  if (entry.cause === "prompt") why += " (you)";
+  return { id: entry.id, ts: entry.ts, kind: "mood", label: entry.moodName, why, in: entry.cause === "prompt" };
+}
+
 // Derives Recent rows from log.mjs's buffer — takes both the entries and the
 // row limit as plain arguments, never reading config itself, so this stays
 // testable against a fixture with no dependency on the machine's real
@@ -69,5 +75,9 @@ function notificationRow(entry) {
 export function list(entries, recentRows) {
   const sorted = [...entries].sort((a, b) => b.ts - a.ts);
   const top = sorted.slice(0, recentRows);
-  return top.map((entry) => (entry.kind === "notification" ? notificationRow(entry) : capabilityRow(entry)));
+  return top.map((entry) => {
+    if (entry.kind === "notification") return notificationRow(entry);
+    if (entry.kind === "mood") return moodRow(entry);
+    return capabilityRow(entry);
+  });
 }

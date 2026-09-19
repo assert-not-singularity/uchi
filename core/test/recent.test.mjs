@@ -67,6 +67,33 @@ test("a cause: null row has no (you) marker and renders in: false", () => {
   assert.equal(rows[0].in, false);
 });
 
+test('a mood entry renders "mood" as why, no line, cause "prompt" marks in: true and "(you)"', () => {
+  const entries = [{ id: 4, ts: 1000, kind: "mood", moodId: "mood-movie-night", moodName: "Movie Night", cause: "prompt" }];
+
+  const rows = list(entries, 20);
+  assert.equal(rows[0].label, "Movie Night");
+  assert.equal(rows[0].why, "mood (you)");
+  assert.equal(rows[0].in, true);
+  assert.equal("line" in rows[0], false);
+});
+
+test("a mood entry with cause: null has no (you) marker and renders in: false", () => {
+  const entries = [{ id: 5, ts: 1000, kind: "mood", moodId: "mood-morning", moodName: "Morning", cause: null }];
+
+  const rows = list(entries, 20);
+  assert.equal(rows[0].why, "mood");
+  assert.equal(rows[0].in, false);
+});
+
+test("appendMood inserts a row log.append would reject (no from/to to compare)", () => {
+  const inserted = log.appendMood({ moodId: "mood-bedtime", moodName: "Bedtime", cause: "prompt" });
+  assert.equal(inserted, true);
+
+  const matching = log.tail(500).filter((e) => e.moodId === "mood-bedtime");
+  assert.equal(matching.length, 1);
+  assert.equal(matching[0].kind, "mood");
+});
+
 test("a notification entry renders label/why verbatim, no line, in: false", () => {
   const entries = [{ id: "notif-1", ts: 500, kind: "notification", ownerName: "Anwesenheit", excerpt: "Alex is home" }];
 
