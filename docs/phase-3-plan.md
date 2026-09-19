@@ -79,10 +79,12 @@ isn't representative of anything official and isn't used as a reference below:
 
 **Scope gaps carried into this phase, flagged rather than silently resolved:**
 
-- `h`/`l` (step a row's capability by one notch) and the `++`/`--` notch value form have no
-  grammar support (still deferred, no phase attached). Wire the keys but have them no-op with a
-  console warning rather than send `grammar.mjs` a line it can't parse — do **not** implement
-  notch parsing here just to make the key do something.
+- `h`/`l` (step the highlighted row's capability by one notch, without typing) has no key bound to
+  it at all — consistent with this phase's later decision to remove every keyboard shortcut beyond
+  typing/navigation/Enter (see "Post-launch refinements" below). The underlying `++`/`--` notch
+  *value form* this key would have sent is a separate thing and **is** implemented (see the value
+  grammar entry below) — typing `desk ++` directly into the prompt works; there's just no
+  single-key shortcut for it.
 - `a` (all off) has no named protocol method anywhere in `design.md`, and can't be built
   client-side from the existing row shape either: a Here/Hero device row is `{ id, label, why,
   line? }` — it doesn't expose which capability `line` targets or the device's raw `onoff`
@@ -448,15 +450,28 @@ anticipated above:
   action, while they were looking straight at the panel, still counted as "unseen since last
   open" until they closed and reopened it. `onNewestRecentTsChanged` now updates the watermark too,
   whenever the panel is currently open, not just at the instant it opens.
+- **The value grammar's step/scale/notch forms were never implemented — and `+10` wasn't just
+  missing, it was silently wrong.** `Number("+10")` parses fine as plain `10`, so `desk +10` set
+  Desk Lamp to a 10% *absolute* level instead of stepping up from wherever it was — it looked like
+  it worked. `parseValue()` now distinguishes all four value forms design.md's grammar table
+  specifies: absolute (`40`, unchanged), step (`+10`/`-10`, relative to the capability's current
+  display value), scale (`*2`/`/2`, levels only — dim/volume, not target_temperature, which has no
+  "half of 21 degrees" reading — clamping at the capability's min/max per design.md rather than
+  dead-ending), and notch (`++`/`--`, one fixed per-kind step read from `resolve()`/`run()`'s new
+  `notches` parameter, threaded from `core/index.mjs`'s `coreConfig.notches`, also clamping).
+  Absolute and step still dead-end on out-of-range, matching existing behavior exactly. This is
+  the value grammar only — the `h`/`l` keyboard shortcut that would trigger a notch without typing
+  stays unbound, per this phase's separate decision to remove every shortcut beyond
+  typing/navigation/Enter.
 
 ## After this phase
 
-Phase 4 (Attention) is the first real consumer of the `x`/`s` keys and `row.dismiss`/
-`row.snooze`/`row.mute` — those RPC methods get added then, against real rows, not speculatively
-here. Phase 5 (Habits) is the same story for whatever's left of `x`. The notch/word grammar gap
-(`h`/`l`, `++`/`--`) has no phase attached in `phase-2-plan.md`'s deferred list; whichever phase
-picks it up should also flip `h`/`l` here from inert to real, since the panel-side wiring already
-exists.
+Phase 4 (Attention) is the first real consumer of `row.dismiss`/`row.snooze`/`row.mute` — those
+RPC methods get added then, against real rows, not speculatively here. Phase 5 (Habits) is the
+same story for whatever muting it needs. Every keyboard shortcut beyond typing/navigation/Enter
+was removed this phase for safety (see "Post-launch refinements"), including `x`/`s` and `h`/`l` —
+whichever phase revisits shortcuts should design them with real per-device judgment from the
+start, not rebuild the blanket versions this phase shipped and then removed.
 
 ## Implementation approach
 

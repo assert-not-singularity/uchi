@@ -8,6 +8,26 @@ import {
 
 const VERB_WORDS = new Set(["on", "off", "lock", "unlock"]);
 
+// design.md's own per-kind names for the core config's `notches` map —
+// distinct from Homey's capability ids, since a person configures step
+// sizes by kind ("light", "vol", "temp"), not by raw capability name.
+const CAPABILITY_KIND = { dim: "light", volume_set: "vol", target_temperature: "temp" };
+
+// design.md's value grammar: absolute (40), step (+10/-10, relative to the
+// capability's current display value), scale (*2//2, levels only), notch
+// (++/--, one fixed per-kind step from core config). Sign disambiguation is
+// design.md's own rule, not a guess: a sign before digits is always a step,
+// never an explicitly-signed absolute value — there is no grammar form for
+// a negative absolute value at all.
+function parseValue(rest) {
+  if (/^[+-]\d+(\.\d+)?$/.test(rest)) return { kind: "step", amount: Number(rest) };
+  if (/^[*/]\d+(\.\d+)?$/.test(rest)) return { kind: "scale", op: rest[0], factor: Number(rest.slice(1)) };
+  if (rest === "++") return { kind: "notch", direction: 1 };
+  if (rest === "--") return { kind: "notch", direction: -1 };
+  const amount = Number(rest);
+  return Number.isFinite(amount) ? { kind: "absolute", amount } : null;
+}
+
 // .trim() on both names: a real house has devices whose stored Homey name
 // carries a leading/trailing space (confirmed live — two of three otherwise
 // identically named "Deckenleuchte"s had one, the third didn't), which
@@ -157,7 +177,7 @@ export function lineFor(deviceName, capabilityId, value) {
 // zone (not just the ambiguous list that came before it) — the zone that
 // distinguished this device a moment ago shouldn't vanish the instant it
 // resolves to one.
-function resolveDevice(device, rest, zones) {
+function resolveDevice(device, rest, zones, notches) {
   const capsObj = device.capabilitiesObj ?? {};
   const zoneName = zones[device.zone]?.name;
 
@@ -170,27 +190,54 @@ function resolveDevice(device, rest, zones) {
       return { matches: [], action: { deviceId: device.id, capabilityId: "locked", value: word === "lock" } };
     }
     // Recognized word, unsupported by this device — falls through to the
-    // bare-number step below, which rejects it as non-numeric.
+    // value step below, which rejects it as not a recognized value form.
   }
 
   if (rest === "") return deadEnd(device.name, "needs a verb or number", zoneName);
 
-  const numeric = Number(rest);
-  if (!Number.isFinite(numeric)) return deadEnd(device.name, "needs a number", zoneName);
+  const parsed = parseValue(rest);
+  if (!parsed) return deadEnd(device.name, "needs a number", zoneName);
 
   const setableNumeric = NUMERIC_TARGETS.filter((id) => capsObj[id]?.setable);
   if (setableNumeric.length !== 1) return deadEnd(device.name, "needs a word", zoneName);
 
   const capabilityId = setableNumeric[0];
-  const value = PERCENT_CAPABILITIES.has(capabilityId) ? toHomeyValue(capabilityId, numeric) : numeric;
-  const { min, max } = capsObj[capabilityId];
+  const isPercent = PERCENT_CAPABILITIES.has(capabilityId);
 
-  if (value < min || value > max) {
-    const displayMin = PERCENT_CAPABILITIES.has(capabilityId) ? toDisplayPercent(capabilityId, min) : min;
-    const displayMax = PERCENT_CAPABILITIES.has(capabilityId) ? toDisplayPercent(capabilityId, max) : max;
+  // Scale is levels-only (dim, volume) per design.md — a thermostat has no
+  // "half of 21 degrees" reading to scale.
+  if (parsed.kind === "scale" && !isPercent) return deadEnd(device.name, "needs a word", zoneName);
+
+  const { min, max } = capsObj[capabilityId];
+  const displayMin = isPercent ? toDisplayPercent(capabilityId, min) : min;
+  const displayMax = isPercent ? toDisplayPercent(capabilityId, max) : max;
+  const currentDisplay = isPercent ? toDisplayPercent(capabilityId, capsObj[capabilityId].value) : capsObj[capabilityId].value;
+
+  let displayValue;
+  let clamps = false;
+  if (parsed.kind === "absolute") {
+    displayValue = parsed.amount;
+  } else if (parsed.kind === "step") {
+    displayValue = currentDisplay + parsed.amount;
+  } else if (parsed.kind === "scale") {
+    displayValue = parsed.op === "*" ? currentDisplay * parsed.factor : currentDisplay / parsed.factor;
+    clamps = true; // "clamps at 0/100" per design.md
+  } else {
+    // notch: one fixed step per kind, from core config — clamps rather
+    // than dead-ending, since a low-friction quick-adjust dial shouldn't
+    // suddenly error out at the boundary.
+    const step = notches?.[CAPABILITY_KIND[capabilityId]] ?? 1;
+    displayValue = currentDisplay + parsed.direction * step;
+    clamps = true;
+  }
+
+  if (clamps) {
+    displayValue = Math.max(displayMin, Math.min(displayMax, displayValue));
+  } else if (displayValue < displayMin || displayValue > displayMax) {
     return deadEnd(device.name, `needs ${displayMin}–${displayMax}`, zoneName);
   }
 
+  const value = isPercent ? toHomeyValue(capabilityId, displayValue) : displayValue;
   return { matches: [], action: { deviceId: device.id, capabilityId, value } };
 }
 
@@ -220,7 +267,7 @@ function resolveDevice(device, rest, zones) {
 // a known word, it's never a zone guess, so there's no reason to try
 // matching it as one at all — simpler and more direct than narrowing what
 // counts as a zone match to dodge the collision.
-function narrowByZone(candidates, restTokens, zones) {
+function narrowByZone(candidates, restTokens, zones, notches) {
   if (restTokens.length === 0) return null;
   if (VERB_WORDS.has(restTokens[0].toLowerCase())) return null;
 
@@ -235,7 +282,7 @@ function narrowByZone(candidates, restTokens, zones) {
     const narrowed = candidates.filter((t) => t.zone === zone.id);
     const afterZone = restTokens.slice(relevantMatch.consumed).join(" ").trim();
     if (narrowed.length > 1) return ambiguous(narrowed, zones, afterZone);
-    return resolveDevice(narrowed[0].ref, afterZone, zones);
+    return resolveDevice(narrowed[0].ref, afterZone, zones, notches);
   }
 
   const anyMatch = matchThing(restTokens, toZoneThings(Object.values(zones)));
@@ -247,7 +294,7 @@ function narrowByZone(candidates, restTokens, zones) {
 // prompt.resolve's implementation: always { matches: [...] } plus optionally
 // exactly one of room or action — see docs/phase-2-plan.md's grammar.mjs
 // section for why this one shape is load-bearing for run() below.
-export function resolve(text, { devices, zones }) {
+export function resolve(text, { devices, zones, notches }) {
   const trimmed = text.trim();
   if (trimmed === "") return { matches: [] };
 
@@ -264,7 +311,7 @@ export function resolve(text, { devices, zones }) {
     // zone (e.g. "Attic" the zone vs. "Attic" the device) has no zone of
     // its own to narrow by, and stays exactly as ambiguous as today.
     if (matched.matches.every((t) => t.kind === "device")) {
-      const narrowed = narrowByZone(matched.matches, rest, zones);
+      const narrowed = narrowByZone(matched.matches, rest, zones, notches);
       if (narrowed) return narrowed;
     }
     return ambiguous(matched.matches, zones, rest.join(" ").trim());
@@ -280,15 +327,15 @@ export function resolve(text, { devices, zones }) {
     return deadEnd(thing.name, "needs a word");
   }
 
-  return resolveDevice(thing.ref, restText, zones);
+  return resolveDevice(thing.ref, restText, zones, notches);
 }
 
 // prompt.run's implementation: re-resolves `line` and, if it names an
 // action, performs it through the caller-supplied setCapabilityValue (the
 // serialized write function core/index.mjs owns) rather than
 // homey.mjs's thin wrapper directly.
-export async function run(line, { devices, zones, setCapabilityValue }) {
-  const result = resolve(line, { devices, zones });
+export async function run(line, { devices, zones, setCapabilityValue, notches }) {
+  const result = resolve(line, { devices, zones, notches });
 
   if (result.action) {
     const device = devices[result.action.deviceId];
